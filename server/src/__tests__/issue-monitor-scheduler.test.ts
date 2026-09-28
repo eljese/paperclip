@@ -247,7 +247,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     return { companyId, agentId, issueId, nextCheckAt };
   }
 
-  it("triggers due issue monitors once and clears the one-shot schedule", async () => {
+  it("triggers due issue monitors once and preserves the policy for re-arm", async () => {
     const { issueId, agentId } = await seedFixture();
     const heartbeat = heartbeatService(db);
     const tickAt = new Date("2026-04-11T12:31:00.000Z");
@@ -257,10 +257,16 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     expect(result.enqueued).toBe(1);
 
     const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    // One-shot generic monitor (no stored interval): the schedule columns
+    // clear, but the execution policy metadata is preserved for crash
+    // forensics instead of stripped.
     expect(issue.monitorNextCheckAt).toBeNull();
     expect(issue.monitorAttemptCount).toBe(1);
     expect(issue.monitorLastTriggeredAt?.toISOString()).toBe(tickAt.toISOString());
-    expect(normalizeIssueExecutionPolicy(issue.executionPolicy ?? null)?.monitor ?? null).toBeNull();
+    expect(normalizeIssueExecutionPolicy(issue.executionPolicy ?? null)?.monitor).toMatchObject({
+      notes: "Check deploy",
+      scheduledBy: "assignee",
+    });
     expect(parseIssueExecutionState(issue.executionState)?.monitor).toMatchObject({
       status: "triggered",
       lastTriggeredAt: tickAt.toISOString(),
@@ -394,7 +400,10 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     expect(issue.monitorNextCheckAt).toBeNull();
     expect(issue.monitorLastTriggeredAt?.toISOString()).toBe(triggeredAt.toISOString());
     expect(issue.monitorAttemptCount).toBe(1);
-    expect(normalizeIssueExecutionPolicy(issue.executionPolicy ?? null)?.monitor ?? null).toBeNull();
+    expect(normalizeIssueExecutionPolicy(issue.executionPolicy ?? null)?.monitor).toMatchObject({
+      notes: "Check deploy",
+      scheduledBy: "assignee",
+    });
 
     const wakeup = await db
       .select()

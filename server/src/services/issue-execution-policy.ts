@@ -1,4 +1,10 @@
 import { randomUUID } from "node:crypto";
+import {
+  ISSUE_MONITOR_MAX_INTERVAL_MS,
+  TOKEN_QUOTA_MONITOR_ALLOWLISTED_ORIGIN,
+  TOKEN_QUOTA_MONITOR_DEFAULT_INTERVAL_MS,
+  TOKEN_QUOTA_MONITOR_SERVICE_NAME,
+} from "@paperclipai/shared";
 import type {
   IssueExecutionDecision,
   IssueExecutionMonitorClearReason,
@@ -88,6 +94,12 @@ function normalizeMonitorText(value: string | null | undefined) {
   return trimmed.length > 0 ? trimmed : null;
 }
 
+function normalizeMonitorIntervalMs(value: number | null | undefined) {
+  if (value === null || value === undefined) return null;
+  if (!Number.isInteger(value) || value <= 0 || value > ISSUE_MONITOR_MAX_INTERVAL_MS) return null;
+  return value;
+}
+
 export function redactIssueMonitorExternalRef(value: string | null | undefined) {
   return normalizeMonitorText(value) ? REDACTED_ISSUE_MONITOR_EXTERNAL_REF : null;
 }
@@ -100,6 +112,7 @@ function monitorMetadataFromPolicy(monitor: IssueExecutionMonitorPolicy) {
     timeoutAt: monitor.timeoutAt ?? null,
     maxAttempts: monitor.maxAttempts ?? null,
     recoveryPolicy: monitor.recoveryPolicy ?? null,
+    intervalMs: normalizeMonitorIntervalMs(monitor.intervalMs),
   };
 }
 
@@ -111,6 +124,7 @@ function monitorMetadataFromState(state: IssueExecutionMonitorState | null | und
     timeoutAt: state?.timeoutAt ?? null,
     maxAttempts: state?.maxAttempts ?? null,
     recoveryPolicy: state?.recoveryPolicy ?? null,
+    intervalMs: normalizeMonitorIntervalMs(state?.intervalMs),
   };
 }
 
@@ -347,6 +361,66 @@ export function setIssueExecutionPolicyMonitorScheduledBy(
   };
 }
 
+/**
+ * Merge a previous monitor into an incoming policy when the raw PATCH body
+ * carried an executionPolicy object without a `monitor` key. Omitting the
+ * key must preserve the schedule; only an explicit `monitor: null` clears
+ * it. Callers must inspect the raw body (post-normalize null is ambiguous).
+ */
+export function mergePreservedExecutionPolicyMonitor(input: {
+  previous: IssueExecutionPolicy | null;
+  next: IssueExecutionPolicy | null;
+  rawMonitorKeyPresent: boolean;
+}): IssueExecutionPolicy | null {
+  if (input.rawMonitorKeyPresent) return input.next;
+  const previousMonitor = input.previous?.monitor ?? null;
+  if (!previousMonitor) return input.next;
+  if (!input.next) return input.previous;
+  return {
+    ...input.next,
+    monitor: previousMonitor,
+  };
+}
+
+/**
+ * Canonical server-owned external ref for a monitor. token-quota monitors
+ * never accept an agent-supplied URL: they always pin the allowlisted
+ * loopback plan-dash origin. Other services keep the trimmed agent value.
+ * The canonical value belongs in the `monitor_external_ref` column; the
+ * execution_policy JSON copy stays redacted.
+ */
+export function resolveCanonicalMonitorExternalRef(input: {
+  serviceName?: string | null;
+  rawExternalRef?: string | null;
+}): string | null {
+  if (input.serviceName === TOKEN_QUOTA_MONITOR_SERVICE_NAME) {
+    return TOKEN_QUOTA_MONITOR_ALLOWLISTED_ORIGIN;
+  }
+  return normalizeMonitorText(input.rawExternalRef);
+}
+
+/**
+ * Re-arm interval for a monitor policy. An explicit stored interval wins;
+ * token-quota monitors without one default to one hour. Generic monitors
+ * without a stored interval are one-shot (null).
+ */
+export function resolveMonitorRearmIntervalMs(
+  monitor: IssueExecutionMonitorPolicy | null | undefined,
+): number | null {
+  const stored = normalizeMonitorIntervalMs(monitor?.intervalMs);
+  if (stored !== null) return stored;
+  if (monitor?.serviceName === TOKEN_QUOTA_MONITOR_SERVICE_NAME) {
+    return TOKEN_QUOTA_MONITOR_DEFAULT_INTERVAL_MS;
+  }
+  return null;
+}
+
+export function advanceMonitorNextCheckAt(scheduledAtIso: string, intervalMs: number): string {
+  const scheduledAt = new Date(scheduledAtIso).getTime();
+  const base = Number.isNaN(scheduledAt) ? Date.now() : scheduledAt;
+  return new Date(base + intervalMs).toISOString();
+}
+
 export function normalizeIssueExecutionPolicy(input: unknown): IssueExecutionPolicy | null {
   if (input == null) return null;
   const parsed = issueExecutionPolicySchema.safeParse(input);
@@ -395,6 +469,7 @@ export function normalizeIssueExecutionPolicy(input: unknown): IssueExecutionPol
       timeoutAt: parsed.data.monitor.timeoutAt ?? null,
       maxAttempts: parsed.data.monitor.maxAttempts ?? null,
       recoveryPolicy: parsed.data.monitor.recoveryPolicy ?? null,
+      intervalMs: normalizeMonitorIntervalMs(parsed.data.monitor.intervalMs),
     }
     : null;
 
@@ -1164,6 +1239,13 @@ export function buildIssueMonitorTriggeredPatch(input: {
   issue: IssueLike;
   policy: IssueExecutionPolicy | null;
   triggeredAt: Date;
+  /**
+   * When provided, the monitor is preserved (execution policy untouched)
+   * and re-armed for this instant instead of cleared. Ordinary dispatch
+   * must pass a re-arm instant; the legacy one-shot clear only applies to
+   * generic monitors without a stored interval.
+   */
+  rearmedNextCheckAt?: Date | string | null;
 }) {
   const existingState = parseIssueExecutionState(input.issue.executionState);
   const currentMonitorState = derivePersistedMonitorState({
@@ -1176,8 +1258,33 @@ export function buildIssueMonitorTriggeredPatch(input: {
     triggeredAt: input.triggeredAt,
   });
 
+  if (input.rearmedNextCheckAt) {
+    const rearmed =
+      input.rearmedNextCheckAt instanceof Date
+        ? input.rearmedNextCheckAt
+        : new Date(input.rearmedNextCheckAt);
+    return {
+      executionPolicy: (input.policy ?? null) as Record<string, unknown> | null,
+      executionState: executionStateWithMonitor(existingState, {
+        ...nextMonitorState,
+        status: "scheduled",
+        nextCheckAt: rearmed.toISOString(),
+      }) as Record<string, unknown> | null,
+      monitorNextCheckAt: rearmed,
+      monitorWakeRequestedAt: null,
+      monitorLastTriggeredAt: input.triggeredAt,
+      monitorAttemptCount: nextMonitorState.attemptCount,
+      monitorNotes: nextMonitorState.notes,
+      monitorScheduledBy: nextMonitorState.scheduledBy,
+    };
+  }
+
+  // One-shot generic monitor (no stored interval): the schedule columns
+  // clear, but the execution policy metadata is preserved for crash
+  // forensics. Ordinary dispatch never strips the policy; only explicit
+  // clears (bounds, invalid assignee/status, manual) do.
   return {
-    executionPolicy: stripMonitorFromExecutionPolicy(input.policy) as Record<string, unknown> | null,
+    executionPolicy: (input.policy ?? null) as Record<string, unknown> | null,
     executionState: executionStateWithMonitor(existingState, nextMonitorState) as Record<string, unknown> | null,
     monitorNextCheckAt: null,
     monitorWakeRequestedAt: null,
@@ -1185,6 +1292,64 @@ export function buildIssueMonitorTriggeredPatch(input: {
     monitorAttemptCount: nextMonitorState.attemptCount,
     monitorNotes: nextMonitorState.notes,
     monitorScheduledBy: nextMonitorState.scheduledBy,
+  };
+}
+
+/**
+ * Re-arm a standing monitor after a check that must not consume maxAttempts
+ * (healthy token-quota polls). The schedule advances by the stored interval
+ * (or the token-quota default) with the attempt count untouched, so a
+ * standing monitor never dies after N healthy hours. The execution policy
+ * (including kind/serviceName/timeoutAt/maxAttempts/recoveryPolicy) is
+ * preserved verbatim.
+ */
+export function buildIssueMonitorRearmedPatch(input: {
+  issue: IssueLike;
+  policy: IssueExecutionPolicy | null;
+  checkedAt: Date;
+  rearmedNextCheckAt: Date | string;
+}) {
+  const existingState = parseIssueExecutionState(input.issue.executionState);
+  const currentMonitorState = derivePersistedMonitorState({
+    issue: input.issue,
+    state: existingState,
+    policy: input.policy,
+  });
+  const rearmed =
+    input.rearmedNextCheckAt instanceof Date
+      ? input.rearmedNextCheckAt
+      : new Date(input.rearmedNextCheckAt);
+  const attemptCount = currentMonitorState?.attemptCount ?? input.issue.monitorAttemptCount ?? 0;
+  const scheduledState: IssueExecutionMonitorState = {
+    status: "scheduled",
+    nextCheckAt: rearmed.toISOString(),
+    lastTriggeredAt: input.checkedAt.toISOString(),
+    attemptCount,
+    notes: currentMonitorState?.notes ?? normalizeMonitorNotes(input.issue.monitorNotes),
+    scheduledBy:
+      currentMonitorState?.scheduledBy ??
+      (input.issue.monitorScheduledBy === "assignee" || input.issue.monitorScheduledBy === "board"
+        ? input.issue.monitorScheduledBy
+        : null),
+    kind: currentMonitorState?.kind ?? null,
+    serviceName: currentMonitorState?.serviceName ?? null,
+    externalRef: currentMonitorState?.externalRef ?? null,
+    timeoutAt: currentMonitorState?.timeoutAt ?? null,
+    maxAttempts: currentMonitorState?.maxAttempts ?? null,
+    recoveryPolicy: currentMonitorState?.recoveryPolicy ?? null,
+    intervalMs: currentMonitorState?.intervalMs ?? null,
+    clearedAt: null,
+    clearReason: null,
+  };
+  return {
+    executionPolicy: (input.policy ?? null) as Record<string, unknown> | null,
+    executionState: executionStateWithMonitor(existingState, scheduledState) as Record<string, unknown> | null,
+    monitorNextCheckAt: rearmed,
+    monitorWakeRequestedAt: null,
+    monitorLastTriggeredAt: input.checkedAt,
+    monitorAttemptCount: attemptCount,
+    monitorNotes: scheduledState.notes,
+    monitorScheduledBy: scheduledState.scheduledBy,
   };
 }
 

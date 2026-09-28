@@ -529,6 +529,27 @@ export type IssueExecutionMonitorKind = (typeof ISSUE_EXECUTION_MONITOR_KINDS)[n
 
 export const PROVIDER_QUOTA_MONITOR_SERVICE_NAME = "AI provider quota";
 
+/**
+ * Server-owned cheap poll for plan-dash token quota. Unlike the provider
+ * quota monitor above (which recovers failed Pi runs), this service name
+ * marks a standing schedule that the server polls in-process without ever
+ * starting Pi when healthy. Agent-supplied URLs are ignored: the poller
+ * only contacts the allowlisted loopback plan-dash origin below.
+ */
+export const TOKEN_QUOTA_MONITOR_SERVICE_NAME = "token-quota";
+
+/** Allowlisted plan-dash origin for token-quota polls. Loopback only. */
+export const TOKEN_QUOTA_MONITOR_ALLOWLISTED_ORIGIN = "http://127.0.0.1:8787";
+
+/** Default re-arm interval for token-quota monitors without a stored interval. */
+export const TOKEN_QUOTA_MONITOR_DEFAULT_INTERVAL_MS = 60 * 60 * 1000;
+
+/** Wake once when remaining quota drops below this percent (plan-dash default). */
+export const TOKEN_QUOTA_LOW_REMAINING_THRESHOLD_PERCENT = 15;
+
+/** Upper bound for an explicit monitor re-arm interval (30 days). */
+export const ISSUE_MONITOR_MAX_INTERVAL_MS = 30 * 24 * 60 * 60 * 1000;
+
 export const ISSUE_EXECUTION_MONITOR_RECOVERY_POLICIES = [
   "wake_owner",
   "create_recovery_issue",

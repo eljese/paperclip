@@ -662,6 +662,13 @@ export interface IssueExecutionMonitorPolicy {
   timeoutAt?: string | null;
   maxAttempts?: number | null;
   recoveryPolicy?: IssueExecutionMonitorRecoveryPolicy | null;
+  /**
+   * Re-arm interval in milliseconds. The scheduler advances nextCheckAt by
+   * this interval after each dispatch so a standing monitor survives its own
+   * trigger. Null means one-shot schedule semantics (generic monitors);
+   * token-quota monitors fall back to the server default (1 hour).
+   */
+  intervalMs?: number | null;
 }
 
 export interface IssueExecutionPolicy {
@@ -694,6 +701,8 @@ export interface IssueExecutionMonitorState {
   recoveryPolicy?: IssueExecutionMonitorRecoveryPolicy | null;
   clearedAt: string | null;
   clearReason: IssueExecutionMonitorClearReason | null;
+  /** Re-arm interval in milliseconds (see IssueExecutionMonitorPolicy). */
+  intervalMs?: number | null;
 }
 
 export interface IssueReviewRequest {

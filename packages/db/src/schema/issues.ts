@@ -74,6 +74,11 @@ export const issues = pgTable(
     monitorAttemptCount: integer("monitor_attempt_count").notNull().default(0),
     monitorNotes: text("monitor_notes"),
     monitorScheduledBy: text("monitor_scheduled_by"),
+    // Server-owned canonical monitor external ref. Unlike the redacted copy
+    // inside execution_policy JSON, this column keeps the real value so the
+    // server poller survives normalize, dispatch, and reload. Never expose
+    // it in agent/public read models.
+    monitorExternalRef: text("monitor_external_ref"),
     executionWorkspaceId: uuid("execution_workspace_id")
       .references((): AnyPgColumn => executionWorkspaces.id, { onDelete: "set null" }),
     executionWorkspacePreference: text("execution_workspace_preference"),

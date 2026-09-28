@@ -92,6 +92,9 @@ import {
   ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY,
   ISSUE_DISPOSITION_REPAIR_RETRY_REASON,
   PROVIDER_QUOTA_MONITOR_SERVICE_NAME,
+  TOKEN_QUOTA_MONITOR_ALLOWLISTED_ORIGIN,
+  TOKEN_QUOTA_MONITOR_DEFAULT_INTERVAL_MS,
+  TOKEN_QUOTA_MONITOR_SERVICE_NAME,
   envBindingSchema,
   isEnvironmentDriverSupportedForAdapter,
   isToolConnectionAttentionHealth,
@@ -149,6 +152,7 @@ import {
   issueThreadInteractions,
   issues,
   issueWorkProducts,
+  tokenQuotaMonitorState,
   nativeRunFinalizations,
   projects,
   projectWorkspaces,
@@ -164,6 +168,13 @@ import {
   toolProfiles,
   workspaceOperations,
 } from "@paperclipai/db";
+import {
+  mergeNotifiedKeys,
+  pollTokenQuotaMonitor,
+  tokenQuotaPollBaseUrl,
+  type TokenQuotaFetch,
+  type TokenQuotaWakeCondition,
+} from "./token-quota-monitor.js";
 import { conflict, HttpError, notFound } from "../errors.js";
 import {
   getStartupTraceContext,
@@ -406,9 +417,13 @@ import { visibleIssueCondition } from "./issue-visibility.js";
 import { ISSUE_BLOCKERS_RESOLVED_WAKE_REASON } from "./issue-dependency-wakeups.js";
 import {
   buildIssueMonitorClearedPatch,
+  buildIssueMonitorRearmedPatch,
   buildIssueMonitorTriggeredPatch,
+  advanceMonitorNextCheckAt,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
+  resolveCanonicalMonitorExternalRef,
+  resolveMonitorRearmIntervalMs,
 } from "./issue-execution-policy.js";
 import {
   ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS,
@@ -11125,6 +11140,7 @@ export function heartbeatService(
     monitorAttemptCount: issues.monitorAttemptCount,
     monitorNotes: issues.monitorNotes,
     monitorScheduledBy: issues.monitorScheduledBy,
+    monitorExternalRef: issues.monitorExternalRef,
   };
 
   interface IssueMonitorDispatchRow {
@@ -11147,6 +11163,7 @@ export function heartbeatService(
     monitorAttemptCount: number | null;
     monitorNotes: string | null;
     monitorScheduledBy: string | null;
+    monitorExternalRef: string | null;
   }
 
   function parseMonitorDate(value: string | null | undefined) {
@@ -11483,6 +11500,25 @@ export function heartbeatService(
       }),
     });
 
+    // A required token-quota monitor that ends (bounds exhaustion) gets one
+    // explicit control-plane alert instead of silent disappearance or a
+    // second recovery wake: the alert below carries the single assignee
+    // wake. Expected clears (done/cancelled/explicit null/invalid assignee)
+    // never reach this path: done/cancelled and ineligible issues are
+    // filtered before dispatch, and explicit null clears happen in the
+    // routes layer.
+    if (input.monitor?.serviceName === TOKEN_QUOTA_MONITOR_SERVICE_NAME) {
+      await emitMonitorRequiredMissing({
+        claimed: input.claimed,
+        scheduledAtIso: input.scheduledAtIso,
+        reason: input.clearReason,
+        now: input.now,
+        actorType: input.actorType,
+        actorId: input.actorId,
+      });
+      return { outcome: "skipped" as const, reason: input.clearReason };
+    }
+
     await performIssueMonitorRecovery({
       claimed: input.claimed,
       scheduledAtIso: input.scheduledAtIso,
@@ -11500,6 +11536,367 @@ export function heartbeatService(
     return { outcome: "skipped" as const, reason: input.clearReason };
   }
 
+  /**
+   * One idempotent control-plane alert for the unexpected loss of a
+   * required token-quota monitor. Expected clears (done, cancelled,
+   * explicit null, invalid assignee) never reach this helper. Repeat
+   * attempts for the same scheduled instant are deduplicated on the
+   * stored activity record, and at most one assignee wake is queued.
+   */
+  async function emitMonitorRequiredMissing(input: {
+    claimed: IssueMonitorDispatchRow;
+    scheduledAtIso: string;
+    reason: string;
+    now: Date;
+    actorType: "user" | "agent" | "system";
+    actorId: string;
+  }) {
+    const existing = await db
+      .select({ id: activityLog.id })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.entityType, "issue"),
+          eq(activityLog.entityId, input.claimed.id),
+          eq(activityLog.action, "issue.monitor_required_missing"),
+          sql`${activityLog.details} ->> 'scheduledAt' = ${input.scheduledAtIso}`,
+        ),
+      )
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (existing) return { outcome: "deduped" as const };
+
+    await logActivity(db, {
+      companyId: input.claimed.companyId,
+      actorType: input.actorType,
+      actorId: input.actorId,
+      agentId: null,
+      runId: null,
+      action: "issue.monitor_required_missing",
+      entityType: "issue",
+      entityId: input.claimed.id,
+      details: {
+        identifier: input.claimed.identifier,
+        serviceName: TOKEN_QUOTA_MONITOR_SERVICE_NAME,
+        scheduledAt: input.scheduledAtIso,
+        reason: input.reason,
+      },
+    });
+
+    await db.insert(issueComments).values({
+      companyId: input.claimed.companyId,
+      issueId: input.claimed.id,
+      body: [
+        `Paperclip lost the required token-quota monitor for ${formatIssueIdentifierLink(input.claimed.identifier, input.claimed.id)} (scheduled ${input.scheduledAtIso}).`,
+        "",
+        `Reason: ${input.reason}. The standing schedule was not cleared by done, cancelled, an explicit monitor removal, or an assignee change.`,
+        "",
+        "Next action: inspect the monitor schedule on this issue and restore it if the quota watch is still required.",
+      ].join("\n"),
+    });
+
+    if (input.claimed.assigneeAgentId) {
+      await enqueueWakeup(input.claimed.assigneeAgentId, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: "issue_monitor_required_missing",
+        idempotencyKey: `monitor-required-missing:${input.claimed.id}:${input.scheduledAtIso}`,
+        payload: {
+          issueId: input.claimed.id,
+          scheduledAt: input.scheduledAtIso,
+          serviceName: TOKEN_QUOTA_MONITOR_SERVICE_NAME,
+          reason: input.reason,
+        },
+        requestedByActorType: input.actorType,
+        requestedByActorId: input.actorId,
+        contextSnapshot: {
+          issueId: input.claimed.id,
+          source: "issue.monitor.required_missing",
+          wakeReason: "issue_monitor_required_missing",
+          scheduledAt: input.scheduledAtIso,
+          serviceName: TOKEN_QUOTA_MONITOR_SERVICE_NAME,
+          reason: input.reason,
+        },
+      });
+    }
+    return { outcome: "alerted" as const };
+  }
+
+  /**
+   * Server-owned cheap poll for token-quota monitors. Healthy polls re-arm
+   * the schedule without consuming maxAttempts and never start Pi.
+   * Anomalies wake the assignee once per condition and keep the monitor
+   * scheduled. The poller only fetches the allowlisted loopback origin.
+   */
+  async function dispatchTokenQuotaMonitor(
+    claimed: IssueMonitorDispatchRow,
+    input: {
+      policy: ReturnType<typeof normalizeIssueExecutionPolicy>;
+      monitor: IssueExecutionMonitorPolicy | null;
+      scheduledAtIso: string;
+      nextAttemptCount: number;
+      now: Date;
+      source: "automation" | "on_demand";
+      actorType: "user" | "agent" | "system";
+      actorId: string;
+      agentId: string | null;
+      runId: string | null;
+      activitySource: "manual" | "scheduled";
+      fetchImpl?: TokenQuotaFetch;
+    },
+  ) {
+    // Legacy rows may predate the server-owned column; pin to the
+    // allowlisted origin in memory rather than observing null.
+    const canonicalRef =
+      readNonEmptyString(claimed.monitorExternalRef) ??
+      resolveCanonicalMonitorExternalRef({
+        serviceName: TOKEN_QUOTA_MONITOR_SERVICE_NAME,
+        rawExternalRef: claimed.monitorExternalRef,
+      }) ??
+      TOKEN_QUOTA_MONITOR_ALLOWLISTED_ORIGIN;
+    const rearmIntervalMs =
+      resolveMonitorRearmIntervalMs(input.monitor) ?? TOKEN_QUOTA_MONITOR_DEFAULT_INTERVAL_MS;
+    const rearmedNextCheckAt = new Date(
+      new Date(input.scheduledAtIso).getTime() + rearmIntervalMs,
+    );
+    const monitorMetadata = {
+      serviceName: input.monitor?.serviceName ?? null,
+      timeoutAt: input.monitor?.timeoutAt ?? null,
+      maxAttempts: input.monitor?.maxAttempts ?? null,
+      recoveryPolicy: input.monitor?.recoveryPolicy ?? null,
+      intervalMs: input.monitor?.intervalMs ?? null,
+    };
+
+    if (!tokenQuotaPollBaseUrl(canonicalRef)) {
+      await db
+        .update(issues)
+        .set({
+          ...buildIssueMonitorRearmedPatch({
+            issue: claimed,
+            policy: input.policy,
+            checkedAt: input.now,
+            rearmedNextCheckAt,
+          }),
+          updatedAt: new Date(),
+        })
+        .where(eq(issues.id, claimed.id));
+      await logActivity(db, {
+        companyId: claimed.companyId,
+        actorType: input.actorType,
+        actorId: input.actorId,
+        agentId: input.agentId,
+        runId: input.runId,
+        action: "issue.monitor_skipped",
+        entityType: "issue",
+        entityId: claimed.id,
+        details: {
+          identifier: claimed.identifier,
+          nextCheckAt: input.scheduledAtIso,
+          attemptCount: claimed.monitorAttemptCount ?? 0,
+          notes: claimed.monitorNotes ?? null,
+          reason: "external_ref_not_allowlisted",
+          source: input.activitySource,
+        },
+      });
+      return { outcome: "skipped" as const, reason: "external_ref_not_allowlisted" };
+    }
+
+    const stored = await db
+      .select()
+      .from(tokenQuotaMonitorState)
+      .where(eq(tokenQuotaMonitorState.issueId, claimed.id))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    const notifiedKeys = Array.isArray(stored?.notifiedKeys) ? stored.notifiedKeys : [];
+    const fetchImpl: TokenQuotaFetch =
+      input.fetchImpl ??
+      (async (url, init) => {
+        const response = await fetch(url, init);
+        return {
+          status: response.status,
+          json: () => response.json() as Promise<unknown>,
+        };
+      });
+    const outcome = await pollTokenQuotaMonitor({
+      canonicalRef,
+      fetchImpl,
+      notifiedKeys,
+      baselineFingerprint: stored?.routingFingerprint ?? null,
+    });
+    if (!outcome.allowed) {
+      throw conflict("Token-quota poll origin is not allowlisted");
+    }
+
+    const mergedKeys = mergeNotifiedKeys(notifiedKeys, outcome.consumeKeys, outcome.resolveKeys);
+    if (stored) {
+      await db
+        .update(tokenQuotaMonitorState)
+        .set({
+          routingFingerprint: outcome.fingerprint,
+          baselineAt: stored.baselineAt ?? (outcome.fingerprint ? input.now : null),
+          notifiedKeys: mergedKeys,
+          updatedAt: input.now,
+        })
+        .where(eq(tokenQuotaMonitorState.issueId, claimed.id));
+    } else {
+      await db.insert(tokenQuotaMonitorState).values({
+        issueId: claimed.id,
+        companyId: claimed.companyId,
+        routingFingerprint: outcome.fingerprint,
+        baselineAt: outcome.fingerprint ? input.now : null,
+        notifiedKeys: mergedKeys,
+      });
+    }
+
+    if (outcome.healthy) {
+      await db
+        .update(issues)
+        .set({
+          ...buildIssueMonitorRearmedPatch({
+            issue: claimed,
+            policy: input.policy,
+            checkedAt: input.now,
+            rearmedNextCheckAt,
+          }),
+          updatedAt: new Date(),
+        })
+        .where(eq(issues.id, claimed.id));
+      await logActivity(db, {
+        companyId: claimed.companyId,
+        actorType: input.actorType,
+        actorId: input.actorId,
+        agentId: input.agentId,
+        runId: input.runId,
+        action: "issue.monitor_checked",
+        entityType: "issue",
+        entityId: claimed.id,
+        details: {
+          identifier: claimed.identifier,
+          nextCheckAt: input.scheduledAtIso,
+          rearmedNextCheckAt: rearmedNextCheckAt.toISOString(),
+          attemptCount: claimed.monitorAttemptCount ?? 0,
+          serviceName: TOKEN_QUOTA_MONITOR_SERVICE_NAME,
+          healthy: true,
+          source: input.activitySource,
+        },
+      });
+      return { outcome: "checked" as const };
+    }
+
+    try {
+      for (const condition of outcome.conditions) {
+        await enqueueWakeup(claimed.assigneeAgentId!, {
+          source: input.source,
+          triggerDetail: "system",
+          reason: "issue_monitor_due",
+          idempotencyKey: `token-quota:${claimed.id}:${condition.identity}:${input.scheduledAtIso}`,
+          payload: {
+            issueId: claimed.id,
+            nextCheckAt: input.scheduledAtIso,
+            monitorAttemptCount: input.nextAttemptCount,
+            monitorNotes: claimed.monitorNotes ?? null,
+            ...monitorMetadata,
+            tokenQuotaCondition: condition.kind,
+            tokenQuotaConditionIdentity: condition.identity,
+            tokenQuotaSummary: condition.summary,
+            tokenQuotaDetails: condition.details,
+            source: input.activitySource,
+          },
+          requestedByActorType: input.actorType,
+          requestedByActorId: input.actorId,
+          contextSnapshot: {
+            issueId: claimed.id,
+            source: "issue.monitor",
+            wakeReason: "issue_monitor_due",
+            nextCheckAt: input.scheduledAtIso,
+            monitorAttemptCount: input.nextAttemptCount,
+            monitorNotes: claimed.monitorNotes ?? null,
+            ...monitorMetadata,
+            tokenQuotaCondition: condition.kind,
+            tokenQuotaConditionIdentity: condition.identity,
+            tokenQuotaSummary: condition.summary,
+            manualTrigger: input.activitySource === "manual",
+          },
+        });
+      }
+    } catch (err) {
+      // A failed anomaly wake must not lose a required monitor: keep the
+      // schedule and report the skip instead of clearing it.
+      await db
+        .update(issues)
+        .set({
+          ...buildIssueMonitorRearmedPatch({
+            issue: claimed,
+            policy: input.policy,
+            checkedAt: input.now,
+            rearmedNextCheckAt,
+          }),
+          updatedAt: new Date(),
+        })
+        .where(eq(issues.id, claimed.id));
+      await logActivity(db, {
+        companyId: claimed.companyId,
+        actorType: input.actorType,
+        actorId: input.actorId,
+        agentId: input.agentId,
+        runId: input.runId,
+        action: "issue.monitor_skipped",
+        entityType: "issue",
+        entityId: claimed.id,
+        details: {
+          identifier: claimed.identifier,
+          nextCheckAt: input.scheduledAtIso,
+          attemptCount: input.nextAttemptCount,
+          notes: claimed.monitorNotes ?? null,
+          reason: err instanceof Error ? err.message : String(err),
+          source: input.activitySource,
+        },
+      });
+      return { outcome: "skipped" as const, reason: "wake_failed" };
+    }
+
+    await db
+      .update(issues)
+      .set({
+        ...buildIssueMonitorTriggeredPatch({
+          issue: claimed,
+          policy: input.policy,
+          triggeredAt: input.now,
+          rearmedNextCheckAt,
+        }),
+        updatedAt: new Date(),
+      })
+      .where(eq(issues.id, claimed.id));
+
+    await logActivity(db, {
+      companyId: claimed.companyId,
+      actorType: input.actorType,
+      actorId: input.actorId,
+      agentId: input.agentId,
+      runId: input.runId,
+      action: "issue.monitor_triggered",
+      entityType: "issue",
+      entityId: claimed.id,
+      details: {
+        identifier: claimed.identifier,
+        nextCheckAt: input.scheduledAtIso,
+        rearmedNextCheckAt: rearmedNextCheckAt.toISOString(),
+        lastTriggeredAt: input.now.toISOString(),
+        attemptCount: input.nextAttemptCount,
+        notes: claimed.monitorNotes ?? null,
+        ...monitorMetadata,
+        tokenQuotaConditions: outcome.conditions.map((condition: TokenQuotaWakeCondition) => ({
+          kind: condition.kind,
+          identity: condition.identity,
+          summary: condition.summary,
+        })),
+        source: `token-quota-poll:${input.activitySource}`,
+      },
+    });
+
+    return { outcome: "triggered" as const };
+  }
+
   async function dispatchClaimedIssueMonitor(
     claimed: IssueMonitorDispatchRow,
     input: {
@@ -11513,6 +11910,8 @@ export function heartbeatService(
       runId: string | null;
       clearOnClientError: boolean;
       activitySource: "manual" | "scheduled";
+      /** Test seam: deterministic plan-dash fetch for token-quota polls. */
+      fetchImpl?: TokenQuotaFetch;
     },
   ) {
     if (!claimed.assigneeAgentId || !claimed.monitorNextCheckAt) {
@@ -11584,6 +11983,24 @@ export function heartbeatService(
         agentId: input.agentId,
         runId: input.runId,
         activitySource: input.activitySource,
+      });
+    }
+
+    // Server-owned cheap poll: healthy token-quota checks never start Pi.
+    if (monitor?.serviceName === TOKEN_QUOTA_MONITOR_SERVICE_NAME) {
+      return dispatchTokenQuotaMonitor(claimed, {
+        policy,
+        monitor,
+        scheduledAtIso,
+        nextAttemptCount,
+        now: input.now,
+        source: input.source,
+        actorType: input.actorType,
+        actorId: input.actorId,
+        agentId: input.agentId,
+        runId: input.runId,
+        activitySource: input.activitySource,
+        ...(input.fetchImpl ? { fetchImpl: input.fetchImpl } : {}),
       });
     }
 
@@ -11676,6 +12093,17 @@ export function heartbeatService(
           },
         });
 
+      // Preserve-or-re-arm: the execution policy (kind, serviceName,
+      // externalRef, timeoutAt, maxAttempts, recoveryPolicy, scheduledBy)
+      // survives dispatch. Monitors with a stored interval (and token-quota
+      // monitors via their 1h default) advance in the same transaction, so
+      // a crash after claim never loses the schedule. Generic monitors
+      // without a stored interval keep one-shot schedule semantics.
+      const rearmIntervalMs = resolveMonitorRearmIntervalMs(monitor);
+      const rearmedNextCheckAt =
+        rearmIntervalMs !== null
+          ? new Date(new Date(scheduledAtIso).getTime() + rearmIntervalMs)
+          : null;
       await db
         .update(issues)
         .set({
@@ -11683,6 +12111,7 @@ export function heartbeatService(
             issue: claimed,
             policy,
             triggeredAt: input.now,
+            ...(rearmedNextCheckAt ? { rearmedNextCheckAt } : {}),
           }),
           updatedAt: new Date(),
         })
@@ -11712,6 +12141,16 @@ export function heartbeatService(
     } catch (err) {
       if (err instanceof HttpError && err.status >= 400 && err.status < 500) {
         if (input.clearOnClientError) {
+          if (monitor?.serviceName === TOKEN_QUOTA_MONITOR_SERVICE_NAME) {
+            await emitMonitorRequiredMissing({
+              claimed,
+              scheduledAtIso,
+              reason: `dispatch_skipped:${err.message}`,
+              now: input.now,
+              actorType: input.actorType,
+              actorId: input.actorId,
+            });
+          }
           await db
             .update(issues)
             .set({
@@ -11777,6 +12216,8 @@ export function heartbeatService(
       agentId?: string | null;
       runId?: string | null;
       wakeReason?: string;
+      /** Test seam: deterministic plan-dash fetch for token-quota polls. */
+      fetchImpl?: TokenQuotaFetch;
     },
   ) {
     const now = input?.now ?? new Date();
@@ -11848,10 +12289,11 @@ export function heartbeatService(
       runId: input?.runId ?? null,
       clearOnClientError: false,
       activitySource: "manual",
+      ...(input?.fetchImpl ? { fetchImpl: input.fetchImpl } : {}),
     });
   }
 
-  async function tickDueIssueMonitors(now = new Date()) {
+  async function tickDueIssueMonitors(now = new Date(), opts?: { fetchImpl?: TokenQuotaFetch }) {
     const staleClaimThreshold = new Date(now.getTime() - 5 * 60 * 1000);
     const dueMonitors = await db
       .select(issueMonitorDispatchColumns)
@@ -11917,6 +12359,7 @@ export function heartbeatService(
           runId: null,
           clearOnClientError: true,
           activitySource: "scheduled",
+          ...(opts?.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}),
         });
         if (result.outcome === "triggered") triggered += 1;
         if (result.outcome === "skipped") skipped += 1;
@@ -29617,7 +30060,7 @@ export function heartbeatService(
 
     buildRunOutputSilence,
 
-    tickTimers: async (now = new Date()) => {
+    tickTimers: async (now = new Date(), opts?: { fetchImpl?: TokenQuotaFetch }) => {
       if ((await getSchedulingSuppression()).suppressed) {
         return {
           checked: 0,
@@ -29695,7 +30138,7 @@ export function heartbeatService(
         else skipped += 1;
       }
 
-      const issueMonitors = await tickDueIssueMonitors(now);
+      const issueMonitors = await tickDueIssueMonitors(now, opts);
 
       return {
         checked: checked + issueMonitors.checked,

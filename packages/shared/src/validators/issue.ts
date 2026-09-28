@@ -32,6 +32,7 @@ import {
   ISSUE_THREAD_INTERACTION_RESOLVER_POLICY_PROVENANCES,
   ISSUE_THREAD_INTERACTION_STATUSES,
   ISSUE_WATCHDOG_DISCOVERY_KINDS,
+  ISSUE_MONITOR_MAX_INTERVAL_MS,
   REQUEST_CHECKBOX_CONFIRMATION_OPTION_LIMIT,
   REQUEST_ITEM_VERDICTS_ITEM_LIMIT,
 } from "../constants.js";
@@ -429,6 +430,14 @@ export const issueExecutionMonitorPolicySchema = z.object({
     .optional()
     .nullable()
     .default(null),
+  intervalMs: z
+    .number()
+    .int()
+    .positive()
+    .max(ISSUE_MONITOR_MAX_INTERVAL_MS)
+    .optional()
+    .nullable()
+    .default(null),
 });
 
 export const issueExecutionPolicySchema = z.object({
@@ -487,6 +496,14 @@ export const issueExecutionMonitorStateSchema = z.object({
     .default(null),
   recoveryPolicy: z
     .enum(ISSUE_EXECUTION_MONITOR_RECOVERY_POLICIES)
+    .nullable()
+    .optional()
+    .default(null),
+  intervalMs: z
+    .number()
+    .int()
+    .positive()
+    .max(ISSUE_MONITOR_MAX_INTERVAL_MS)
     .nullable()
     .optional()
     .default(null),

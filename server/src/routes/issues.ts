@@ -294,9 +294,11 @@ import {
 } from "../services/company-search-rate-limit.js";
 import {
   applyIssueExecutionPolicyTransition,
+  mergePreservedExecutionPolicyMonitor,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
   redactIssueMonitorExternalRef,
+  resolveCanonicalMonitorExternalRef,
   setIssueExecutionPolicyMonitorScheduledBy,
 } from "../services/issue-execution-policy.js";
 import { parseIssueExecutionWorkspaceSettings } from "../services/execution-workspace-policy.js";
@@ -2169,6 +2171,37 @@ function applyActorMonitorScheduledBy(
     policy,
     actorType === "user" ? "board" : "assignee",
   );
+}
+
+/**
+ * Server-owned canonical external ref for an incoming monitor. Returns
+ * undefined when no monitor is present (leave the column unset). token-quota
+ * always pins the allowlisted loopback origin and ignores agent URLs.
+ */
+function canonicalMonitorExternalRefForPolicyInput(
+  rawPolicy: unknown,
+  policy: NormalizedExecutionPolicy | null,
+): string | null | undefined {
+  const monitor = policy?.monitor ?? null;
+  if (!monitor) return undefined;
+  const rawMonitor =
+    rawPolicy !== null &&
+    typeof rawPolicy === "object" &&
+    !Array.isArray(rawPolicy) &&
+    "monitor" in rawPolicy
+      ? (rawPolicy as Record<string, unknown>).monitor
+      : null;
+  const rawExternalRef =
+    rawMonitor !== null &&
+    typeof rawMonitor === "object" &&
+    !Array.isArray(rawMonitor) &&
+    typeof (rawMonitor as Record<string, unknown>).externalRef === "string"
+      ? ((rawMonitor as Record<string, unknown>).externalRef as string)
+      : null;
+  return resolveCanonicalMonitorExternalRef({
+    serviceName: monitor.serviceName ?? null,
+    rawExternalRef,
+  });
 }
 
 async function assertCanManageIssueMonitor(
@@ -11849,6 +11882,10 @@ export function issueRoutes(
         normalizeIssueExecutionPolicy(createBody.executionPolicy),
         actor.actorType,
       );
+      const canonicalMonitorExternalRef = canonicalMonitorExternalRefForPolicyInput(
+        createBody.executionPolicy,
+        executionPolicy,
+      );
       await assertCanManageIssueMonitor(
         access,
         req,
@@ -11875,6 +11912,9 @@ export function issueRoutes(
         originRunId: createBody.originRunId ?? actor.runId,
         originIdentityContextId: req.actor.identityContextId ?? null,
         executionPolicy,
+        ...(canonicalMonitorExternalRef !== undefined
+          ? { monitorExternalRef: canonicalMonitorExternalRef }
+          : {}),
         ...(sourceTrust ? { sourceTrust } : {}),
         createdByAgentId: actor.agentId,
         createdByUserId: actor.actorType === "user" ? actor.actorId : null,
@@ -12196,6 +12236,10 @@ export function issueRoutes(
         normalizeIssueExecutionPolicy(createBody.executionPolicy),
         actor.actorType,
       );
+      const canonicalMonitorExternalRef = canonicalMonitorExternalRefForPolicyInput(
+        createBody.executionPolicy,
+        executionPolicy,
+      );
       await assertCanManageIssueMonitor(
         access,
         req,
@@ -12218,6 +12262,9 @@ export function issueRoutes(
         ...(taskBridgeOriginForActor(req) ?? {}),
         id: issueId,
         executionPolicy,
+        ...(canonicalMonitorExternalRef !== undefined
+          ? { monitorExternalRef: canonicalMonitorExternalRef }
+          : {}),
         ...(currentSerializedChild
           ? {
               status: "blocked",
@@ -12420,6 +12467,10 @@ export function issueRoutes(
           normalizeIssueExecutionPolicy(child.executionPolicy),
           actor.actorType,
         );
+        const canonicalMonitorExternalRef = canonicalMonitorExternalRefForPolicyInput(
+          child.executionPolicy,
+          executionPolicy,
+        );
         await assertCanManageIssueMonitor(
           access,
           req,
@@ -12441,6 +12492,9 @@ export function issueRoutes(
           ...child,
           id: childIssueId,
           executionPolicy,
+          ...(canonicalMonitorExternalRef !== undefined
+            ? { monitorExternalRef: canonicalMonitorExternalRef }
+            : {}),
           ...(sourceTrust ? { sourceTrust } : {}),
           createdByAgentId: actor.agentId,
           createdByUserId: actor.actorType === "user" ? actor.actorId : null,
@@ -13189,10 +13243,57 @@ export function issueRoutes(
       const previousExecutionPolicy = normalizeIssueExecutionPolicy(
         existing.executionPolicy ?? null,
       );
-      const nextExecutionPolicy =
+      // Omitting `monitor` inside an executionPolicy PATCH preserves the
+      // existing monitor; only an explicit `monitor: null` (or an explicit
+      // `executionPolicy: null`) clears it.
+      const rawExecutionPolicy = req.body.executionPolicy as
+        | Record<string, unknown>
+        | null
+        | undefined;
+      const rawPolicyIsObject =
+        rawExecutionPolicy !== null &&
+        typeof rawExecutionPolicy === "object" &&
+        !Array.isArray(rawExecutionPolicy);
+      const rawMonitorKeyPresent = rawPolicyIsObject && "monitor" in rawExecutionPolicy;
+      let nextExecutionPolicy =
         updateFields.executionPolicy !== undefined
           ? (updateFields.executionPolicy as NormalizedExecutionPolicy | null)
           : previousExecutionPolicy;
+      if (req.body.executionPolicy !== undefined && rawPolicyIsObject && !rawMonitorKeyPresent) {
+        nextExecutionPolicy = mergePreservedExecutionPolicyMonitor({
+          previous: previousExecutionPolicy,
+          next: nextExecutionPolicy,
+          rawMonitorKeyPresent,
+        }) as NormalizedExecutionPolicy | null;
+        updateFields.executionPolicy = nextExecutionPolicy;
+      }
+      // Persist the server-owned canonical external ref alongside the
+      // (redacted) policy copy so the poller survives reloads. token-quota
+      // always pins the allowlisted loopback origin. A PATCH that omits the
+      // monitor key leaves the stored canonical ref untouched.
+      if (req.body.executionPolicy !== undefined && rawMonitorKeyPresent) {
+        const rawMonitor =
+          rawExecutionPolicy !== null &&
+          typeof rawExecutionPolicy === "object"
+            ? (rawExecutionPolicy.monitor as Record<string, unknown> | null | undefined)
+            : undefined;
+        const nextMonitor = nextExecutionPolicy?.monitor ?? null;
+        if (nextMonitor) {
+          const rawExternalRef =
+            rawMonitor !== null &&
+            typeof rawMonitor === "object" &&
+            !Array.isArray(rawMonitor) &&
+            typeof rawMonitor.externalRef === "string"
+              ? (rawMonitor.externalRef as string)
+              : null;
+          updateFields.monitorExternalRef = resolveCanonicalMonitorExternalRef({
+            serviceName: nextMonitor.serviceName ?? null,
+            rawExternalRef: rawExternalRef,
+          });
+        } else {
+          updateFields.monitorExternalRef = null;
+        }
+      }
       if (normalizedAssigneeAgentId !== undefined) {
         updateFields.assigneeAgentId = normalizedAssigneeAgentId;
       }
