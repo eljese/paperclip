@@ -210,14 +210,26 @@ export async function discoverPiModelsCached(input: {
   const key = discoveryCacheKey(command, env);
   const now = Date.now();
   // Snapshot a possibly-expired entry before pruning so
-  // `allowStaleOnFailure` callers can fall back to it. Expired entries are
+  // `allowStaleOnFailure` callers can fall back to it. The age bound is
+  // enforced here (not just by pruning) so an idle cache can never serve
+  // a fallback older than STALE_RETENTION_MS. Expired entries are
   // otherwise dropped below and failures are never written to the cache.
   const previous = ttlMs > 0 ? discoveryCache.get(key) : undefined;
-  const stale = allowStaleOnFailure && previous && previous.expiresAt <= now ? previous : undefined;
+  const stale =
+    allowStaleOnFailure &&
+    previous &&
+    previous.expiresAt <= now &&
+    previous.expiresAt + STALE_RETENTION_MS > now
+      ? previous
+      : undefined;
   pruneExpiredDiscoveryCache(now);
   const cached = ttlMs > 0 ? discoveryCache.get(key) : undefined;
   if (cached && cached.expiresAt > now) return cached.models;
 
+  // The shared promise stays fail-closed: it never returns stale data.
+  // Each caller applies its own stale snapshot after the shared discovery
+  // settles, so an opt-in caller can never leak stale models into a
+  // strict caller (e.g. the ensure-path) sharing the same flight.
   const inFlight = discoveryInFlight.get(key);
   if (inFlight) {
     try {
@@ -236,15 +248,17 @@ export async function discoverPiModelsCached(input: {
         discoveryCache.set(key, { expiresAt: Date.now() + ttlMs, models });
       }
       return models;
-    } catch (err) {
-      if (stale) return stale.models;
-      throw err;
     } finally {
       if (discoveryInFlight.get(key) === discovery) discoveryInFlight.delete(key);
     }
   })();
   discoveryInFlight.set(key, discovery);
-  return discovery;
+  try {
+    return await discovery;
+  } catch (err) {
+    if (stale) return stale.models;
+    throw err;
+  }
 }
 
 export async function ensurePiModelConfiguredAndAvailable(input: {

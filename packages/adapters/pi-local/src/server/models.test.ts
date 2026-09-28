@@ -253,6 +253,31 @@ describe("pi models discovery", () => {
     expect(models.map((m) => m.id)).toContain("meta/muse-spark-1.3");
   });
 
+  it("never leaks stale results into strict callers sharing a flight", async () => {
+    process.env.PAPERCLIP_PI_MODELS_CACHE_TTL_MS = "80";
+    runChildProcessMock.mockResolvedValue(successResult(LISTING));
+    const fresh = await discoverPiModelsCached();
+    await sleep(150);
+
+    runChildProcessMock.mockRejectedValue(new Error("spawn blew up"));
+    const strictFirst = discoverPiModelsCached();
+    const optInJoiner = discoverPiModelsCached({ allowStaleOnFailure: true });
+    await expect(strictFirst).rejects.toThrow("spawn blew up");
+    await expect(optInJoiner).resolves.toEqual(fresh);
+    expect(runChildProcessMock).toHaveBeenCalledTimes(2);
+
+    // Reverse order: opt-in creator fails, strict joiner still throws.
+    resetPiModelsCacheForTests();
+    runChildProcessMock.mockResolvedValue(successResult(LISTING));
+    const fresh2 = await discoverPiModelsCached();
+    await sleep(150);
+    runChildProcessMock.mockRejectedValue(new Error("spawn blew up"));
+    const optInFirst = discoverPiModelsCached({ allowStaleOnFailure: true });
+    const strictJoiner = discoverPiModelsCached();
+    await expect(optInFirst).resolves.toEqual(fresh2);
+    await expect(strictJoiner).rejects.toThrow("spawn blew up");
+  });
+
   it("listPiModels stays best-effort but honors explicit stale fallback", async () => {
     process.env.PAPERCLIP_PI_MODELS_CACHE_TTL_MS = "80";
     runChildProcessMock.mockResolvedValue(successResult(LISTING));
