@@ -424,6 +424,7 @@ import {
   parseIssueExecutionState,
   resolveCanonicalMonitorExternalRef,
   resolveMonitorRearmIntervalMs,
+  skipMissedMonitorIntervals,
 } from "./issue-execution-policy.js";
 import {
   ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS,
@@ -11480,6 +11481,13 @@ export function heartbeatService(
       })
       .where(eq(issues.id, input.claimed.id));
 
+    // An ended monitor must not leave per-issue poll state behind: a
+    // replacement schedule re-baselines instead of inheriting stale
+    // notified keys or a stale routing fingerprint.
+    await db
+      .delete(tokenQuotaMonitorState)
+      .where(eq(tokenQuotaMonitorState.issueId, input.claimed.id));
+
     await logActivity(db, {
       companyId: input.claimed.companyId,
       actorType: input.actorType,
@@ -11566,23 +11574,10 @@ export function heartbeatService(
       .then((rows) => rows[0] ?? null);
     if (existing) return { outcome: "deduped" as const };
 
-    await logActivity(db, {
-      companyId: input.claimed.companyId,
-      actorType: input.actorType,
-      actorId: input.actorId,
-      agentId: null,
-      runId: null,
-      action: "issue.monitor_required_missing",
-      entityType: "issue",
-      entityId: input.claimed.id,
-      details: {
-        identifier: input.claimed.identifier,
-        serviceName: TOKEN_QUOTA_MONITOR_SERVICE_NAME,
-        scheduledAt: input.scheduledAtIso,
-        reason: input.reason,
-      },
-    });
-
+    // Deliver first, record last: the dedup activity is written only after
+    // the comment and wake succeed, so a partial failure stays retryable
+    // instead of looking delivered. The wake idempotency key keeps a
+    // redelivery after a late activity-write failure safe.
     await db.insert(issueComments).values({
       companyId: input.claimed.companyId,
       issueId: input.claimed.id,
@@ -11619,6 +11614,22 @@ export function heartbeatService(
         },
       });
     }
+    await logActivity(db, {
+      companyId: input.claimed.companyId,
+      actorType: input.actorType,
+      actorId: input.actorId,
+      agentId: null,
+      runId: null,
+      action: "issue.monitor_required_missing",
+      entityType: "issue",
+      entityId: input.claimed.id,
+      details: {
+        identifier: input.claimed.identifier,
+        serviceName: TOKEN_QUOTA_MONITOR_SERVICE_NAME,
+        scheduledAt: input.scheduledAtIso,
+        reason: input.reason,
+      },
+    });
     return { outcome: "alerted" as const };
   }
 
@@ -11656,8 +11667,14 @@ export function heartbeatService(
       TOKEN_QUOTA_MONITOR_ALLOWLISTED_ORIGIN;
     const rearmIntervalMs =
       resolveMonitorRearmIntervalMs(input.monitor) ?? TOKEN_QUOTA_MONITOR_DEFAULT_INTERVAL_MS;
-    const rearmedNextCheckAt = new Date(
-      new Date(input.scheduledAtIso).getTime() + rearmIntervalMs,
+    // Skip fully-missed intervals after downtime so the monitor resumes
+    // from a future slot instead of replaying every missed tick at once.
+    // Within one interval of the scheduled instant this equals
+    // scheduled+interval.
+    const rearmedNextCheckAt = skipMissedMonitorIntervals(
+      new Date(input.scheduledAtIso).getTime(),
+      rearmIntervalMs,
+      input.now.getTime(),
     );
     const monitorMetadata = {
       serviceName: input.monitor?.serviceName ?? null,
@@ -11728,27 +11745,49 @@ export function heartbeatService(
     }
 
     const mergedKeys = mergeNotifiedKeys(notifiedKeys, outcome.consumeKeys, outcome.resolveKeys);
-    if (stored) {
-      await db
-        .update(tokenQuotaMonitorState)
-        .set({
-          routingFingerprint: outcome.fingerprint,
-          baselineAt: stored.baselineAt ?? (outcome.fingerprint ? input.now : null),
-          notifiedKeys: mergedKeys,
-          updatedAt: input.now,
-        })
-        .where(eq(tokenQuotaMonitorState.issueId, claimed.id));
-    } else {
-      await db.insert(tokenQuotaMonitorState).values({
-        issueId: claimed.id,
-        companyId: claimed.companyId,
-        routingFingerprint: outcome.fingerprint,
-        baselineAt: outcome.fingerprint ? input.now : null,
-        notifiedKeys: mergedKeys,
-      });
-    }
+    // Persist poll progress only after the downstream effects succeed: a
+    // failed anomaly wake must not consume notification keys or advance the
+    // routing baseline, otherwise the retry treats the alert as delivered.
+    const persistPollState = async (inputState: {
+      notifiedKeys: string[];
+      fingerprint: string | null;
+      baselineAt: Date | null;
+    }) => {
+      if (stored) {
+        await db
+          .update(tokenQuotaMonitorState)
+          .set({
+            routingFingerprint: inputState.fingerprint,
+            baselineAt: inputState.baselineAt,
+            notifiedKeys: inputState.notifiedKeys,
+            updatedAt: input.now,
+          })
+          .where(eq(tokenQuotaMonitorState.issueId, claimed.id));
+      } else {
+        await db.insert(tokenQuotaMonitorState).values({
+          issueId: claimed.id,
+          companyId: claimed.companyId,
+          routingFingerprint: inputState.fingerprint,
+          baselineAt: inputState.baselineAt,
+          notifiedKeys: inputState.notifiedKeys,
+        });
+      }
+    };
+    const consumedState = {
+      notifiedKeys: mergedKeys,
+      fingerprint: outcome.fingerprint,
+      baselineAt: stored?.baselineAt ?? (outcome.fingerprint ? input.now : null),
+    };
+    // Pre-poll snapshot: restored when anomaly wakes fail so the next tick
+    // re-detects (rather than suppresses) the undelivered conditions.
+    const unconsumedState = {
+      notifiedKeys,
+      fingerprint: stored?.routingFingerprint ?? null,
+      baselineAt: stored?.baselineAt ?? null,
+    };
 
     if (outcome.healthy) {
+      await persistPollState(consumedState);
       await db
         .update(issues)
         .set({
@@ -11821,7 +11860,9 @@ export function heartbeatService(
       }
     } catch (err) {
       // A failed anomaly wake must not lose a required monitor: keep the
-      // schedule and report the skip instead of clearing it.
+      // schedule and report the skip instead of clearing it. Restore the
+      // pre-poll snapshot so the next tick retries the undelivered alert.
+      await persistPollState(unconsumedState);
       await db
         .update(issues)
         .set({
@@ -11854,6 +11895,10 @@ export function heartbeatService(
       });
       return { outcome: "skipped" as const, reason: "wake_failed" };
     }
+
+    // Anomaly wakes queued: only now consume the notification keys and
+    // advance the routing baseline.
+    await persistPollState(consumedState);
 
     await db
       .update(issues)
@@ -12100,9 +12145,11 @@ export function heartbeatService(
       // a crash after claim never loses the schedule. Generic monitors
       // without a stored interval keep one-shot schedule semantics.
       const rearmIntervalMs = resolveMonitorRearmIntervalMs(monitor);
+      // Same catch-up rule as the token-quota poll path: resume from now
+      // when the scheduled instant is long past.
       const rearmedNextCheckAt =
         rearmIntervalMs !== null
-          ? new Date(new Date(scheduledAtIso).getTime() + rearmIntervalMs)
+          ? skipMissedMonitorIntervals(new Date(scheduledAtIso).getTime(), rearmIntervalMs, input.now.getTime())
           : null;
       await db
         .update(issues)
@@ -12163,6 +12210,10 @@ export function heartbeatService(
               updatedAt: new Date(),
             })
             .where(eq(issues.id, claimed.id));
+          // Ended here too: drop per-issue poll state with the schedule.
+          await db
+            .delete(tokenQuotaMonitorState)
+            .where(eq(tokenQuotaMonitorState.issueId, claimed.id));
 
           await logActivity(db, {
             companyId: claimed.companyId,

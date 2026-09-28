@@ -215,7 +215,24 @@ export async function pollTokenQuotaMonitor(input: {
     maybeResolve("health:unreachable");
   }
 
-  const providersRaw = Array.isArray(statusBody.providers) ? statusBody.providers : [];
+  // A 200 response that omits usable quota data must not read as healthy:
+  // flag the invalid shape under the existing health kind (no new
+  // threshold) so the gap wakes the assignee instead of silently re-arming.
+  const providersValue: unknown = statusBody.providers;
+  const modelsValue: unknown = parseObject(statusBody.controlPlane).models;
+  if (!Array.isArray(providersValue) || !Array.isArray(modelsValue)) {
+    maybeNotify("status:invalid-shape", {
+      kind: "health",
+      summary: "plan-dash status response is missing quota data",
+      details: {
+        hasProviders: Array.isArray(providersValue),
+        hasModels: Array.isArray(modelsValue),
+      },
+    });
+  } else {
+    maybeResolve("status:invalid-shape");
+  }
+  const providersRaw = Array.isArray(providersValue) ? providersValue : [];
   for (const providerRaw of providersRaw) {
     const provider = parseObject(providerRaw);
     const providerId =

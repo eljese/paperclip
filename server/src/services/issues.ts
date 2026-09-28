@@ -4902,6 +4902,10 @@ const issueListSelect = {
   monitorAttemptCount: issues.monitorAttemptCount,
   monitorNotes: issues.monitorNotes,
   monitorScheduledBy: issues.monitorScheduledBy,
+  // Server-owned canonical ref stays out of list/read projections: the
+  // poller reads issues.monitor_external_ref through its own select, and
+  // agent/public read models must never observe the unredacted value.
+  monitorExternalRef: sql<null>`null`,
   executionWorkspaceId: issues.executionWorkspaceId,
   executionWorkspacePreference: issues.executionWorkspacePreference,
   executionWorkspaceSettings: sql<null>`null`,

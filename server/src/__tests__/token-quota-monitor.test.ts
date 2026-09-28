@@ -36,6 +36,7 @@ import {
   parseIssueExecutionState,
   resolveCanonicalMonitorExternalRef,
   resolveMonitorRearmIntervalMs,
+  skipMissedMonitorIntervals,
 } from "../services/issue-execution-policy.ts";
 import {
   buildTokenQuotaRoutingFingerprint,
@@ -268,6 +269,45 @@ describe("monitor policy helpers", () => {
 
   it("advances nextCheckAt by the interval", () => {
     expect(advanceMonitorNextCheckAt("2026-04-11T12:30:00.000Z", 3_600_000)).toBe("2026-04-11T13:30:00.000Z");
+  });
+
+  it("keeps scheduled+interval within one interval but skips fully-missed slots after downtime", () => {
+    const scheduled = new Date("2026-04-11T12:30:00.000Z").getTime();
+    expect(
+      skipMissedMonitorIntervals(scheduled, 3_600_000, scheduled + 60_000).toISOString(),
+    ).toBe("2026-04-11T13:30:00.000Z");
+    const jumped = skipMissedMonitorIntervals(scheduled, 3_600_000, scheduled + 5 * 3_600_000 + 60_000);
+    expect(jumped.getTime()).toBeGreaterThan(scheduled + 5 * 3_600_000 + 60_000);
+    expect(jumped.toISOString()).toBe("2026-04-11T18:30:00.000Z");
+  });
+
+  it("flags a status response missing providers or routing models instead of reading healthy", async () => {
+    const calls: string[] = [];
+    const outcome = await pollTokenQuotaMonitor({
+      canonicalRef: ALLOWLISTED_ORIGIN,
+      fetchImpl: mockFetch(
+        { [HEALTHZ_URL]: { ok: true }, [STATUS_URL]: { ok: true } },
+        calls,
+      ),
+      notifiedKeys: [],
+      baselineFingerprint: null,
+    });
+    expect(outcome.allowed).toBe(true);
+    if (!outcome.allowed) return;
+    expect(outcome.healthy).toBe(false);
+    expect(outcome.conditions.map((c) => c.identity)).toEqual(["status:invalid-shape"]);
+    expect(outcome.conditions.map((c) => c.kind)).toEqual(["health"]);
+    const keys = mergeNotifiedKeys([], outcome.consumeKeys, outcome.resolveKeys);
+    const recovered = await pollTokenQuotaMonitor({
+      canonicalRef: ALLOWLISTED_ORIGIN,
+      fetchImpl: healthyFetch(calls),
+      notifiedKeys: keys,
+      baselineFingerprint: outcome.fingerprint,
+    });
+    expect(recovered.allowed).toBe(true);
+    if (!recovered.allowed) return;
+    expect(recovered.healthy).toBe(true);
+    expect(recovered.conditions).toHaveLength(0);
   });
 
   it("preserves the monitor when a PATCH omits the key and clears on explicit null", () => {

@@ -56,6 +56,7 @@ import {
   pipelineStages,
   pipelines,
   projectWorkspaces,
+  tokenQuotaMonitorState,
 } from "@paperclipai/db";
 import {
   addIssueCommentSchema,
@@ -2233,6 +2234,18 @@ async function assertCanManageIssueMonitor(
   throw forbidden(
     "Only the assignee agent or a board user can manage issue monitors",
   );
+}
+
+/**
+ * Server-owned issue columns must never reach agent/public read models.
+ * `monitor_external_ref` keeps the unredacted canonical ref for the
+ * server poller; API responses carry only the redacted policy copy.
+ */
+function stripServerOnlyIssueFields<T extends Record<string, unknown>>(
+  issue: T,
+): Omit<T, "monitorExternalRef"> {
+  const { monitorExternalRef: _omitted, ...rest } = issue;
+  return rest;
 }
 
 function summarizeIssueMonitor(
@@ -8235,7 +8248,7 @@ export function issueRoutes(
         return {
           kind: "full",
           body: result.map((issue) => ({
-            ...issue,
+            ...stripServerOnlyIssueFields(issue),
             successfulRunHandoff: handoffStates.get(issue.id) ?? null,
             activeRecoveryAction: recoveryActionByIssue.get(issue.id) ?? null,
           })),
@@ -8966,7 +8979,7 @@ export function issueRoutes(
       `paperclip_issue;dur=${(performance.now() - requestStartedAt).toFixed(1)}`,
     );
     res.json({
-      ...issue,
+      ...stripServerOnlyIssueFields(issue),
       ...inboxArchiveFields,
       goalId: goal?.id ?? issue.goalId,
       ancestors,
@@ -9591,7 +9604,7 @@ export function issueRoutes(
       });
       if (result.replayed) {
         res.json({
-          issue: result.issue,
+          issue: stripServerOnlyIssueFields(result.issue),
           recoveryAction: result.recoveryAction,
         });
         return;
@@ -9699,7 +9712,7 @@ export function issueRoutes(
 
       res.json({
         issue: {
-          ...result.issue,
+          ...stripServerOnlyIssueFields(result.issue),
           activeRecoveryAction: null,
         },
         recoveryAction: result.recoveryAction,
@@ -11945,7 +11958,7 @@ export function issueRoutes(
         const referenceSummary =
           await issueReferencesSvc.listIssueReferenceSummary(issue.id);
         res.status(200).json({
-          ...issue,
+          ...stripServerOnlyIssueFields(issue),
           deduplicated: true,
           deduplicationReason,
           relatedWork: referenceSummary,
@@ -12129,7 +12142,7 @@ export function issueRoutes(
       await queueTaskWatchdogEvaluation(issue, actor.runId);
 
       res.status(201).json({
-        ...issue,
+        ...stripServerOnlyIssueFields(issue),
         relatedWork: referenceSummary,
         referencedIssueIdentifiers: referenceSummary.outbound.map(
           (item) => item.issue.identifier ?? item.issue.id,
@@ -12850,7 +12863,7 @@ export function issueRoutes(
       }
 
       res.json({
-        issue: result.issue,
+        issue: stripServerOnlyIssueFields(result.issue),
         action: req.body.action,
         comment: result.comment,
         wakeQueued,
@@ -13270,8 +13283,12 @@ export function issueRoutes(
       // Persist the server-owned canonical external ref alongside the
       // (redacted) policy copy so the poller survives reloads. token-quota
       // always pins the allowlisted loopback origin. A PATCH that omits the
-      // monitor key leaves the stored canonical ref untouched.
-      if (req.body.executionPolicy !== undefined && rawMonitorKeyPresent) {
+      // monitor key leaves the stored canonical ref untouched; an explicit
+      // `monitor: null` or `executionPolicy: null` clears it.
+      if (
+        req.body.executionPolicy !== undefined &&
+        (rawMonitorKeyPresent || req.body.executionPolicy === null)
+      ) {
         const rawMonitor =
           rawExecutionPolicy !== null &&
           typeof rawExecutionPolicy === "object"
@@ -13292,6 +13309,16 @@ export function issueRoutes(
           });
         } else {
           updateFields.monitorExternalRef = null;
+        }
+        // A cleared or replaced monitor must not inherit the previous
+        // per-issue poll state (notified keys, routing baseline): a fresh
+        // schedule re-baselines instead of replaying or suppressing alerts.
+        const previousServiceName = previousExecutionPolicy?.monitor?.serviceName ?? null;
+        const nextServiceName = nextMonitor?.serviceName ?? null;
+        if (nextMonitor === null || previousServiceName !== nextServiceName) {
+          await db
+            .delete(tokenQuotaMonitorState)
+            .where(eq(tokenQuotaMonitorState.issueId, existing.id));
         }
       }
       if (normalizedAssigneeAgentId !== undefined) {
@@ -15123,7 +15150,7 @@ export function issueRoutes(
         });
         return;
       }
-      res.json({ ...issueResponse, changes, comment });
+      res.json({ ...stripServerOnlyIssueFields(issueResponse), changes, comment });
     },
   );
 
@@ -15170,7 +15197,7 @@ export function issueRoutes(
     });
 
     await queueTaskWatchdogEvaluation(existing, actor.runId);
-    res.json(issue);
+    res.json(stripServerOnlyIssueFields(issue));
   });
 
   router.post(
@@ -17386,7 +17413,7 @@ export function issueRoutes(
       await logActivity(db, { companyId, actorType: "user", actorId: req.actor.userId,
         action: "issue.conversation_opened", entityType: "issue", entityId: issue.id,
         details: { agentId: agent.id } });
-      res.json(issue);
+      res.json(stripServerOnlyIssueFields(issue));
     });
   }
 

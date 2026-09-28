@@ -421,6 +421,26 @@ export function advanceMonitorNextCheckAt(scheduledAtIso: string, intervalMs: nu
   return new Date(base + intervalMs).toISOString();
 }
 
+/**
+ * Next monitor check that skips fully-missed intervals: when the check runs
+ * within one interval of the scheduled instant the result equals
+ * scheduled+interval; after longer downtime it jumps to the first future
+ * slot instead of leaving the monitor due (which would replay a poll/wake
+ * per missed interval on successive ticks).
+ */
+export function skipMissedMonitorIntervals(
+  scheduledMs: number,
+  intervalMs: number,
+  nowMs: number,
+): Date {
+  const base = Number.isNaN(scheduledMs) ? nowMs : scheduledMs;
+  const first = base + intervalMs;
+  if (first > nowMs) return new Date(first);
+  const missed = Math.ceil((nowMs - base) / intervalMs);
+  const candidate = base + missed * intervalMs;
+  return new Date(candidate > nowMs ? candidate : candidate + intervalMs);
+}
+
 export function normalizeIssueExecutionPolicy(input: unknown): IssueExecutionPolicy | null {
   if (input == null) return null;
   const parsed = issueExecutionPolicySchema.safeParse(input);
@@ -1178,13 +1198,17 @@ function applyMonitorTransition(input: TransitionInput, stagePatch: Record<strin
           clearReason: exhaustedReason,
           clearedAt: new Date(),
         });
-      } else {
+      } else if (input.monitorExplicitlyUpdated || !previousPolicy?.monitor) {
         patch.monitorNextCheckAt = new Date(input.policy.monitor.nextCheckAt);
         patch.monitorWakeRequestedAt = null;
         patch.monitorNotes = input.policy.monitor.notes ?? null;
         patch.monitorScheduledBy = input.policy.monitor.scheduledBy;
         targetMonitorState = buildScheduledMonitorState(currentMonitorState, input.policy.monitor);
       }
+      // Otherwise the monitor was preserved (PATCH omitted the monitor key
+      // or left executionPolicy untouched): the live schedule columns and
+      // execution-state monitor keep the re-armed values instead of being
+      // overwritten with the stale policy copy.
     }
   } else if (previousPolicy?.monitor) {
     patch.monitorNextCheckAt = null;
