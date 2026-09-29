@@ -7,6 +7,26 @@ import { fileURLToPath } from "node:url";
 
 const repoRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
 
+export const STRIPPED_STAGED_LIFECYCLE_SCRIPTS = [
+  "prepack",
+  "postpack",
+  "prepublish",
+  "prepublishOnly",
+  "install",
+  "postinstall",
+  "prepare",
+];
+
+export function stripStagedLifecycleScripts(manifest) {
+  if (!manifest || typeof manifest !== "object" || !manifest.scripts) return manifest;
+  manifest.scripts = { ...manifest.scripts };
+  for (const script of STRIPPED_STAGED_LIFECYCLE_SCRIPTS) {
+    delete manifest.scripts[script];
+  }
+  if (Object.keys(manifest.scripts).length === 0) delete manifest.scripts;
+  return manifest;
+}
+
 export function materializePublishManifest(pkg) {
   const publishConfig = pkg.publishConfig ?? {};
   const publishManifest = { ...pkg };
@@ -28,12 +48,14 @@ export function materializePublishManifest(pkg) {
   }
 
   delete publishManifest.publishConfig;
+  stripStagedLifecycleScripts(publishManifest);
   return publishManifest;
 }
 
 export function createBundledInstallManifest(publishManifest, bundledDependencies) {
   const bundledDependencyNames = new Set(bundledDependencies);
   const installManifest = structuredClone(publishManifest);
+  stripStagedLifecycleScripts(installManifest);
 
   delete installManifest.devDependencies;
 

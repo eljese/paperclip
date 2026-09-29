@@ -22,6 +22,7 @@ import {
   createBundledInstallManifest,
   materializePublishManifest,
   selectBundledDependencyPatches,
+  STRIPPED_STAGED_LIFECYCLE_SCRIPTS,
 } from "./prepare-bundled-package.mjs";
 
 const rootPackage = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
@@ -150,6 +151,28 @@ test("published packages preserve the patched embedded-postgres runtime", () => 
   assert.deepEqual(dbPackage.bundleDependencies, ["embedded-postgres"]);
   assert.equal(bundledCliNpmDependencies.has("embedded-postgres"), true);
   assert.equal(cliEsbuildConfig.external.includes("embedded-postgres"), false);
+});
+
+test("staged bundled manifests strip packaging lifecycle scripts", () => {
+  assert.ok(serverPackage.scripts.prepack, "fixture precondition: server declares prepack");
+  assert.ok(serverPackage.scripts.postpack, "fixture precondition: server declares postpack");
+
+  const published = materializePublishManifest(serverPackage);
+  const installed = createBundledInstallManifest(published, serverPackage.bundleDependencies);
+
+  for (const manifest of [published, installed]) {
+    for (const script of STRIPPED_STAGED_LIFECYCLE_SCRIPTS) {
+      assert.equal(manifest.scripts?.[script], undefined, `staged manifest must not declare ${script}`);
+    }
+  }
+  // Non-lifecycle scripts survive; bare `npm pack <stagedir>` stays inert
+  // because npm only auto-runs the stripped lifecycle hooks.
+  assert.equal(published.scripts.build, serverPackage.scripts.build);
+  assert.equal(published.version, serverPackage.version);
+  assert.deepEqual(published.files, serverPackage.files);
+  assert.ok(installed.dependencies.acpx, "install manifest keeps bundled deps");
+  // Source manifest is untouched (no shared-reference mutation).
+  assert.ok(serverPackage.scripts.prepack, "source manifest keeps prepack");
 });
 
 test("bundled package staging materializes publishConfig entrypoints", () => {
