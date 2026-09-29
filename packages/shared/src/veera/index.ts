@@ -70,3 +70,18 @@ export {
   type CorrectionLedger,
   type CorrectionDecision,
 } from "./routing.js";
+export {
+  evaluateReleaseGate,
+  type ReleaseKind,
+  type ReleaseVerdict,
+  type ReleaseGateInputs,
+  type ReleaseGateResult,
+  type GateBlock,
+} from "./release-gate.js";
+export {
+  evaluateCompletionGate,
+  type CompletionVerdict,
+  type CompletionGateInputs,
+  type CompletionGateResult,
+  type CompletionBlock,
+} from "./completion-gate.js";
