@@ -351,6 +351,9 @@ export async function detectServiceManager(input: { instanceId?: string; platfor
   const runner = input.runner ?? defaultCommandRunner;
   if (platform === "darwin") return { supported: true, manager: new LaunchdServiceManager(instanceId, runner) };
   if (platform !== "linux") return { supported: false, reason: `Service management is not supported on ${platform}. Use paperclipai run instead.` };
+  if ((process.env.NODE_ENV === "test" || process.env.VITEST === "true") && input.runner === undefined) {
+    return { supported: false, reason: "Service management is disabled during tests unless a command runner is injected." };
+  }
   try {
     await runner("systemctl", ["--user", "show-environment"]);
     return { supported: true, manager: new SystemdServiceManager(instanceId, runner) };
