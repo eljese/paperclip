@@ -1,11 +1,64 @@
 #!/usr/bin/env node
 
 import { execFileSync } from "node:child_process";
-import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const repoRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
+
+const workspaceVersionCache = new Map();
+
+export function clearWorkspaceVersionCache() {
+  workspaceVersionCache.clear();
+}
+
+/**
+ * Build a workspace package name -> version map by scanning `sourceRoot` for
+ * package.json files (skipping node_modules, .git, and build output dirs).
+ *
+ * Used to resolve `workspace:*` specifiers to the *target* workspace
+ * package's version (matching `pnpm pack` semantics) instead of the
+ * dependent's own version. Results are cached per sourceRoot; call
+ * `clearWorkspaceVersionCache()` in tests that mutate the fixture tree.
+ */
+export function readWorkspaceVersions(sourceRoot) {
+  const root = resolve(sourceRoot);
+  const cached = workspaceVersionCache.get(root);
+  if (cached) return cached;
+
+  const versions = new Map();
+  const SKIP_DIRS = new Set(["node_modules", ".git", "dist", "build", ".turbo"]);
+  const stack = [root];
+  while (stack.length > 0) {
+    const dir = stack.pop();
+    let entries;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory() && !(entry.isFile() && entry.name === "package.json")) continue;
+      if (entry.isFile()) {
+        try {
+          const manifest = JSON.parse(readFileSync(join(dir, entry.name), "utf8"));
+          if (typeof manifest?.name === "string" && typeof manifest?.version === "string") {
+            if (!versions.has(manifest.name)) versions.set(manifest.name, manifest.version);
+          }
+        } catch {
+          // Ignore unreadable/invalid manifests while scanning.
+        }
+        continue;
+      }
+      if (SKIP_DIRS.has(entry.name)) continue;
+      stack.push(join(dir, entry.name));
+    }
+  }
+
+  workspaceVersionCache.set(root, versions);
+  return versions;
+}
 
 export const STRIPPED_STAGED_LIFECYCLE_SCRIPTS = [
   "prepack",
@@ -27,12 +80,21 @@ export function stripStagedLifecycleScripts(manifest) {
   return manifest;
 }
 
-export function materializePublishManifest(pkg) {
+export function materializePublishManifest(pkg, options = {}) {
   const publishConfig = pkg.publishConfig ?? {};
   const publishManifest = { ...pkg };
 
   for (const key of ["main", "types", "exports", "bin"]) {
     if (publishConfig[key] !== undefined) publishManifest[key] = publishConfig[key];
+  }
+
+  // Resolve `workspace:*` to the target workspace package's version (pnpm
+  // pack semantics). Falls back to the dependent's own version when the
+  // target cannot be found, which preserves the release flow's uniform
+  // calver behavior where every workspace version is identical.
+  let workspaceVersions = options.workspaceVersions;
+  if (!workspaceVersions && options.sourceRoot) {
+    workspaceVersions = readWorkspaceVersions(options.sourceRoot);
   }
 
   for (const section of ["dependencies", "optionalDependencies", "peerDependencies"]) {
@@ -42,7 +104,8 @@ export function materializePublishManifest(pkg) {
         if (typeof specifier !== "string" || !specifier.startsWith("workspace:")) return [name, specifier];
         const range = specifier.slice("workspace:".length);
         const prefix = range === "^" || range === "~" ? range : "";
-        return [name, `${prefix}${pkg.version}`];
+        const targetVersion = workspaceVersions?.get(name) ?? pkg.version;
+        return [name, `${prefix}${targetVersion}`];
       }),
     );
   }
@@ -158,7 +221,7 @@ export function applyBundledDependencyPatches(destinationDir, bundledDependencie
   }
 }
 
-export function prepareBundledPackage(sourceDir, destinationDir, { sourceRoot = repoRoot } = {}) {
+export function prepareBundledPackage(sourceDir, destinationDir, { sourceRoot = repoRoot, workspaceVersions } = {}) {
   const sourcePackagePath = resolve(sourceDir, "package.json");
   const sourcePackage = JSON.parse(readFileSync(sourcePackagePath, "utf8"));
   const bundledDependencies = sourcePackage.bundleDependencies ?? sourcePackage.bundledDependencies ?? [];
@@ -198,7 +261,10 @@ export function prepareBundledPackage(sourceDir, destinationDir, { sourceRoot = 
   }
 
   const deployedPackagePath = resolve(destinationDir, "package.json");
-  const publishManifest = materializePublishManifest(sourcePackage);
+  const resolvedWorkspaceVersions = workspaceVersions ?? readWorkspaceVersions(sourceRoot);
+  const publishManifest = materializePublishManifest(sourcePackage, {
+    workspaceVersions: resolvedWorkspaceVersions,
+  });
   const installManifest = createBundledInstallManifest(publishManifest, bundledDependencies);
   writeFileSync(deployedPackagePath, `${JSON.stringify(installManifest, null, 2)}\n`);
 

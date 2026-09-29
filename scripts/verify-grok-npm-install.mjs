@@ -35,6 +35,10 @@ try {
   run(process.execPath, [join(repo, 'scripts/build-standalone-public-packages.mjs')], repo);
   run('bash', [join(repo, 'scripts/prepare-server-ui-dist.sh')], repo);
   const tarballs = [];
+  // Uniform release versions: every co-packed workspace tarball carries
+  // releaseVersion, so workspace:* must resolve to releaseVersion here (as
+  // release.sh's set-version rewrite would produce), not to the source
+  // tree's independently versioned manifests (e.g. plugin-sdk 1.0.0).
   for (const [index, name] of [...needed].entries()) {
     const { dir, manifest } = packages.get(name);
     const target = join(root, `package-${index}`); mkdirSync(target);
@@ -49,11 +53,12 @@ try {
     }
     const releaseManifest = { ...manifest, version: releaseVersion };
     writeFileSync(join(stagedSource, 'package.json'), JSON.stringify(releaseManifest));
+    const uniformWorkspaceVersions = new Map([...needed].map((packageName) => [packageName, releaseVersion]));
     if ((manifest.bundleDependencies ?? manifest.bundledDependencies ?? []).length) {
-      prepareBundledPackage(stagedSource, target);
+      prepareBundledPackage(stagedSource, target, { sourceRoot: repo, workspaceVersions: uniformWorkspaceVersions });
     } else {
       cpSync(stagedSource, target, { recursive: true });
-      writeFileSync(join(target, 'package.json'), JSON.stringify(materializePublishManifest(releaseManifest)));
+      writeFileSync(join(target, 'package.json'), JSON.stringify(materializePublishManifest(releaseManifest, { workspaceVersions: uniformWorkspaceVersions })));
     }
     run('npm', ['pack', '--ignore-scripts', '--pack-destination', root], target);
     const packed = readdirSync(root).filter(f => f.endsWith('.tgz') && !tarballs.includes(join(root, f)));
