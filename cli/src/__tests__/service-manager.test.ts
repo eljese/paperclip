@@ -114,6 +114,14 @@ describe("service adapter dispatch", () => {
     if (detection.supported) expect(detection.manager).toBeInstanceOf(SystemdServiceManager);
   });
 
+  it("does not probe the live user manager from tests without an injected runner", async () => {
+    const detection = await detectServiceManager({ platform: "linux", instanceId: "default" });
+    expect(detection).toEqual({
+      supported: false,
+      reason: expect.stringContaining("disabled during tests"),
+    });
+  });
+
   it("returns a foreground-run skip on unsupported hosts", async () => {
     const runner: CommandRunner = async () => { throw new Error("no bus"); };
     const detection = await detectServiceManager({ platform: "linux", instanceId: "default", runner });
