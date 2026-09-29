@@ -147,6 +147,26 @@ export function prepareBundledPackage(sourceDir, destinationDir, { sourceRoot = 
 
   rmSync(destinationDir, { recursive: true, force: true });
   mkdirSync(destinationDir, { recursive: true });
+  // Git-install bootstrap compat: older published installers never ran the
+  // release.sh packaging prep, so materialize generated `files` entries from
+  // the repo's own inputs before the verbatim copy loop below. No-op when the
+  // artifacts already exist (newer installers prepare them up front).
+  if ((sourcePackage.files ?? []).includes("ui-dist") && !existsSync(resolve(sourceDir, "ui-dist"))) {
+    const uiPrep = resolve(sourceRoot, "scripts/prepare-server-ui-dist.sh");
+    if (existsSync(uiPrep)) {
+      execFileSync("bash", [uiPrep], {
+        cwd: sourceRoot,
+        env: { ...process.env, PAPERCLIP_RELEASE_REUSE_UI_DIST: "1" },
+        stdio: "inherit",
+      });
+    }
+  }
+  if ((sourcePackage.files ?? []).includes("skills") && !existsSync(resolve(sourceDir, "skills"))) {
+    const repoSkills = resolve(sourceRoot, "skills");
+    if (existsSync(repoSkills)) {
+      cpSync(repoSkills, resolve(sourceDir, "skills"), { recursive: true });
+    }
+  }
   for (const entry of sourcePackage.files ?? []) {
     cpSync(resolve(sourceDir, entry), resolve(destinationDir, entry), { recursive: true });
   }
