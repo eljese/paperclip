@@ -1,0 +1,43 @@
+{
+  "kind": "requirements-audit",
+  "schemaVersion": "1.0.0",
+  "deliveryId": "JES-000",
+  "checkpoint": "final",
+  "attempt": 1,
+  "contractRef": {
+    "deliveryId": "JES-000",
+    "contractHash": "RECOMPUTED_AT_RUNTIME_OVER_EXACT_CONTRACT_BYTES"
+  },
+  "candidate": {
+    "repo": "github.com/eljese/paperclip",
+    "sha": "062c8d7237a9d3e1671c2b071da73bae6fc23d63"
+  },
+  "sourceCompleteness": {
+    "accepted": true,
+    "verifierRole": "veera",
+    "checkedAt": "2026-09-29T00:00:00.000Z",
+    "note": "Direct PRD-vs-contract comparison: every normative commitment mapped."
+  },
+  "findings": [
+    {
+      "requirementId": "JES-1",
+      "result": "PASS",
+      "evidence": [
+        {
+          "requirementId": "JES-1",
+          "criterion": "Behavior is observable in the candidate build",
+          "sourcePathOrArtifact": "packages/shared/src/veera/example.ts",
+          "method": "Ran candidate build and inspected output",
+          "outcome": "The thing was observed",
+          "durableRef": "ci-artifact:example-run-1",
+          "candidateOrBuildIdentity": "github.com/eljese/paperclip @ 062c8d7237a9d3e1671c2b071da73bae6fc23d63"
+        }
+      ]
+    },
+    {
+      "requirementId": "JES-2",
+      "result": "MISSING",
+      "note": "Advisory gap, reported without blocking."
+    }
+  ]
+}

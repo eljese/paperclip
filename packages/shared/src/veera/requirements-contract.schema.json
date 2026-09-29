@@ -1,0 +1,172 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://paperclip.ing/schemas/veera/requirements-contract-1.0.0.json",
+  "title": "Veera requirements-contract",
+  "description": "Machine-readable source commitments for one delivery. The SHA-256 contract_hash is computed over the exact authoritative UTF-8 contract bytes and stored OUTSIDE this document (never a self-contained hash field).",
+  "type": "object",
+  "required": [
+    "kind",
+    "schemaVersion",
+    "deliveryId",
+    "sources",
+    "scopeAuthority",
+    "releaseBoundary",
+    "requirements"
+  ],
+  "properties": {
+    "kind": { "const": "requirements-contract" },
+    "schemaVersion": { "const": "1.0.0" },
+    "deliveryId": { "type": "string", "minLength": 1 },
+    "sources": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["ref", "sha256"],
+        "properties": {
+          "ref": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Durable source snapshot reference (e.g. issue document key + revision, attachment id)."
+          },
+          "sha256": { "$ref": "#/$defs/sha256" }
+        },
+        "additionalProperties": false
+      }
+    },
+    "scopeAuthority": {
+      "type": "object",
+      "required": ["authority", "approvalChannel"],
+      "properties": {
+        "authority": { "type": "string", "minLength": 1 },
+        "approvalChannel": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "releaseBoundary": {
+      "type": "object",
+      "required": ["scope", "preReleaseBoundary", "postDeploymentBoundary"],
+      "properties": {
+        "scope": { "type": "string", "minLength": 1 },
+        "preReleaseBoundary": { "type": "string", "minLength": 1 },
+        "postDeploymentBoundary": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "noMandatoryScope": {
+      "type": "object",
+      "description": "Required if and only if the active mandatory set is empty: an explicit authorized no-mandatory-scope classification. Never inferred.",
+      "required": ["classification", "approval"],
+      "properties": {
+        "classification": { "const": "no-mandatory-scope" },
+        "approval": { "$ref": "#/$defs/amendmentRef" }
+      },
+      "additionalProperties": false
+    },
+    "requirements": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/requirement" }
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "Lowercase hex SHA-256."
+    },
+    "fullSha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$",
+      "description": "Full 40-char git commit SHA (never abbreviated)."
+    },
+    "amendmentRef": {
+      "type": "object",
+      "description": "Citation of a scope approval. The authoritative record (with bound hashes) lives in the delivery record (issue thread + request_board_approval) and is supplied to the validator via bindings. A bare approved_by string is rejected; implementer/Veera self-approval is rejected.",
+      "required": [
+        "approvalRecordType",
+        "approvalId",
+        "issueId",
+        "approverRole"
+      ],
+      "properties": {
+        "approvalRecordType": { "const": "issue-thread+request_board_approval" },
+        "approvalId": { "type": "string", "minLength": 1 },
+        "issueId": { "type": "string", "minLength": 1 },
+        "approverRole": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "requirement": {
+      "type": "object",
+      "required": [
+        "id",
+        "classification",
+        "behavior",
+        "acceptanceCriteria",
+        "sourceLocations",
+        "lifecycle"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[A-Z0-9]+-[0-9]+$",
+          "description": "Stable requirement ID, never reused for unrelated behavior."
+        },
+        "classification": { "enum": ["mandatory", "advisory"] },
+        "behavior": { "type": "string", "minLength": 1 },
+        "acceptanceCriteria": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "sourceLocations": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": ["location", "excerpt"],
+            "properties": {
+              "location": { "type": "string", "minLength": 1 },
+              "excerpt": { "type": "string", "minLength": 1 }
+            },
+            "additionalProperties": false
+          }
+        },
+        "planRefs": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "description": "Planned task references covering this requirement."
+        },
+        "verificationMethod": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Required for every mandatory requirement (plan checkpoint)."
+        },
+        "lifecycle": { "enum": ["active", "removed", "superseded"] },
+        "amendmentRefs": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/amendmentRef" },
+          "description": "Required for lifecycle removed|superseded: traceable authorized amendment."
+        }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": { "classification": { "const": "mandatory" } },
+            "required": ["classification"]
+          },
+          "then": { "required": ["verificationMethod"] }
+        },
+        {
+          "if": {
+            "properties": { "lifecycle": { "enum": ["removed", "superseded"] } },
+            "required": ["lifecycle"]
+          },
+          "then": { "required": ["amendmentRefs"], "properties": { "amendmentRefs": { "minItems": 1 } } }
+        }
+      ]
+    }
+  }
+}
