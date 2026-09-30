@@ -1,0 +1,25 @@
+diff --git a/dist/index.js b/dist/index.js
+index 87213c3614d88e42ee858cc72bda040e2b81b0fe..48cbcf17bf1728751e5c9bd63f7e3cada21c560b 100755
+--- a/dist/index.js
++++ b/dist/index.js
+@@ -33444,6 +33444,11 @@ var DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1";
+ var SUPPORTED_GATEWAY_PROTOCOLS = {
+   openai: "responses"
+ };
++function paperclipSandboxPolicy(sandboxPolicy) {
++  const networkAccess = process.env.PAPERCLIP_CODEX_ACP_NETWORK_ACCESS;
++  if (sandboxPolicy.type !== "workspaceWrite" || !["true", "false"].includes(networkAccess)) return sandboxPolicy;
++  return { ...sandboxPolicy, networkAccess: networkAccess === "true" && process.env.PAPERCLIP_RUNNER_NETWORK_ACCESS !== "disabled" };
++}
+ var CodexAcpClient = class {
+   codexClient;
+   config;
+@@ -34133,7 +34138,7 @@ var CodexAcpClient = class {
+       input: input2,
+       approvalPolicy: agentMode.approvalPolicy,
+       approvalsReviewer: agentMode.approvalsReviewer,
+-      sandboxPolicy: addAdditionalDirectoriesToSandboxPolicy(agentMode.sandboxPolicy, additionalDirectories),
++      sandboxPolicy: addAdditionalDirectoriesToSandboxPolicy(paperclipSandboxPolicy(agentMode.sandboxPolicy), additionalDirectories),
+       summary: disableSummary ? "none" : "auto",
+       effort,
+       model: modelId.model,

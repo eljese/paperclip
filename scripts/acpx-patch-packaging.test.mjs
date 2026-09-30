@@ -40,6 +40,9 @@ const serverPackage = JSON.parse(
 const dbPackage = JSON.parse(
   await readFile(new URL("../packages/db/package.json", import.meta.url), "utf8"),
 );
+const codexLocalPackage = JSON.parse(
+  await readFile(new URL("../packages/adapters/codex-local/package.json", import.meta.url), "utf8"),
+);
 const releaseScript = await readFile(new URL("./release.sh", import.meta.url), "utf8");
 const releaseLib = await readFile(new URL("./release-lib.sh", import.meta.url), "utf8");
 const buildNpmScript = await readFile(new URL("./build-npm.sh", import.meta.url), "utf8");
@@ -49,6 +52,10 @@ const acpxRuntimePatch = await readFile(
 );
 const claudeAcpPatch = await readFile(
   new URL("../patches/@agentclientprotocol__claude-agent-acp@0.73.0.patch", import.meta.url),
+  "utf8",
+);
+const codexAcpPatch = await readFile(
+  new URL("../patches/@agentclientprotocol__codex-acp@1.13.1.patch", import.meta.url),
   "utf8",
 );
 
@@ -135,7 +142,7 @@ test("Paperclip Runner pins the qualified ACPX host callbacks", () => {
   );
   assert.equal(runnerPackage.dependencies.acpx, "0.13.1");
   assert.equal(runnerPackage.dependencies["@agentclientprotocol/claude-agent-acp"], "0.73.0");
-  assert.equal(runnerPackage.dependencies["@agentclientprotocol/codex-acp"], "1.6.2");
+  assert.equal(runnerPackage.dependencies["@agentclientprotocol/codex-acp"], "1.13.1");
   for (const callback of [
     "spawnEnvironment", "spawnCwd", "spawnAgent", "isPlainStringEnvironment",
     "onAgentSpawn", "onAgentStderr", "onAgentExit",
@@ -143,6 +150,21 @@ test("Paperclip Runner pins the qualified ACPX host callbacks", () => {
   ]) assert.match(acpxRuntimePatch, new RegExp(callback));
   assert.match(claudeAcpPatch, /usage: \{/);
   assert.match(claudeAcpPatch, /cache_creation_input_tokens/);
+});
+
+test("codex-acp network hook pins agree and the adapter vendors the patched runtime", () => {
+  // The npm-installed artifact once floated ^1.6.2 to stock 1.13.1, dropping
+  // the network-access hook. Every pin must name the patched version exactly.
+  assert.equal(
+    rootPackage.pnpm.patchedDependencies["@agentclientprotocol/codex-acp@1.13.1"],
+    "patches/@agentclientprotocol__codex-acp@1.13.1.patch",
+  );
+  assert.equal(runnerPackage.dependencies["@agentclientprotocol/codex-acp"], "1.13.1");
+  assert.equal(codexLocalPackage.dependencies["@agentclientprotocol/codex-acp"], "1.13.1");
+  assert.ok(codexLocalPackage.bundleDependencies.includes("@agentclientprotocol/codex-acp"));
+  assert.match(codexAcpPatch, /function paperclipSandboxPolicy\(/);
+  assert.match(codexAcpPatch, /PAPERCLIP_CODEX_ACP_NETWORK_ACCESS/);
+  assert.match(codexAcpPatch, /paperclipSandboxPolicy\(agentMode\.sandboxPolicy\)/);
 });
 
 test("published packages preserve the patched embedded-postgres runtime", () => {
@@ -486,6 +508,141 @@ printf 'patched spawnEnvironment runtime\\n' > "$target/dist/runtime.js"
       `${specifier} receives its own full configured patch`,
     );
   }
+});
+
+test("staged codex-acp bundle carries the network-access hook", (t) => {
+  const fixtureDir = mkdtempSync(join(tmpdir(), "paperclip-codex-acp-stage-"));
+  const sourceDir = join(fixtureDir, "source");
+  const destinationDir = join(fixtureDir, "destination");
+  const binDir = join(fixtureDir, "bin");
+  mkdirSync(join(sourceDir, "dist"), { recursive: true });
+  writeFileSync(join(sourceDir, "dist", "index.js"), "export {};\n");
+  writeFileSync(
+    join(sourceDir, "package.json"),
+    JSON.stringify({
+      name: "@paperclipai/adapter-codex-local",
+      version: codexLocalPackage.version,
+      files: ["dist"],
+      dependencies: { "@agentclientprotocol/codex-acp": "1.13.1" },
+      bundleDependencies: ["@agentclientprotocol/codex-acp"],
+    }),
+  );
+  mkdirSync(destinationDir);
+  mkdirSync(binDir);
+  t.after(() => rmSync(fixtureDir, { recursive: true, force: true }));
+
+  const writeExecutable = (name, body) => {
+    writeFileSync(join(binDir, name), body, { mode: 0o755 });
+  };
+  writeExecutable("pnpm", `#!/usr/bin/env bash\nset -euo pipefail\nexit 0\n`);
+  writeExecutable(
+    "npm",
+    `#!/usr/bin/env bash
+set -euo pipefail
+[ "$*" = "install --omit=dev --ignore-scripts --no-audit --no-fund" ]
+dir="node_modules/@agentclientprotocol/codex-acp"
+mkdir -p "$dir/dist"
+printf '{"name":"@agentclientprotocol/codex-acp","version":"1.13.1"}\\n' > "$dir/package.json"
+printf 'stock runtime without the hook\\n' > "$dir/dist/index.js"
+`,
+  );
+  writeExecutable(
+    "patch",
+    `#!/usr/bin/env bash
+set -euo pipefail
+target=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-d" ]; then
+    target="$2"
+    shift 2
+  else
+    shift
+  fi
+done
+patch_input="$(cat)"
+printf '%s\\n' "$patch_input" > "$target/applied.patch"
+grep -q paperclipSandboxPolicy <<< "$patch_input"
+grep -q PAPERCLIP_CODEX_ACP_NETWORK_ACCESS <<< "$patch_input"
+printf 'function paperclipSandboxPolicy(sandboxPolicy) { return process.env.PAPERCLIP_CODEX_ACP_NETWORK_ACCESS; }\\n' >> "$target/dist/index.js"
+`,
+  );
+
+  execFileSync(
+    process.execPath,
+    [
+      new URL("./prepare-bundled-package.mjs", import.meta.url).pathname,
+      sourceDir,
+      destinationDir,
+    ],
+    {
+      env: { ...process.env, PATH: `${binDir}:${process.env.PATH}` },
+      stdio: "pipe",
+    },
+  );
+
+  const stagedDist = join(
+    destinationDir,
+    "node_modules/@agentclientprotocol/codex-acp/dist/index.js",
+  );
+  assert.match(readFileSync(stagedDist, "utf8"), /function paperclipSandboxPolicy\(/);
+  assert.match(readFileSync(stagedDist, "utf8"), /PAPERCLIP_CODEX_ACP_NETWORK_ACCESS/);
+});
+
+test("staged codex-acp bundle fails closed when the hook is missing", (t) => {
+  const fixtureDir = mkdtempSync(join(tmpdir(), "paperclip-codex-acp-stage-fail-"));
+  const sourceDir = join(fixtureDir, "source");
+  const destinationDir = join(fixtureDir, "destination");
+  const binDir = join(fixtureDir, "bin");
+  mkdirSync(join(sourceDir, "dist"), { recursive: true });
+  writeFileSync(join(sourceDir, "dist", "index.js"), "export {};\n");
+  writeFileSync(
+    join(sourceDir, "package.json"),
+    JSON.stringify({
+      name: "@paperclipai/adapter-codex-local",
+      version: codexLocalPackage.version,
+      files: ["dist"],
+      dependencies: { "@agentclientprotocol/codex-acp": "1.13.1" },
+      bundleDependencies: ["@agentclientprotocol/codex-acp"],
+    }),
+  );
+  mkdirSync(destinationDir);
+  mkdirSync(binDir);
+  t.after(() => rmSync(fixtureDir, { recursive: true, force: true }));
+
+  const writeExecutable = (name, body) => {
+    writeFileSync(join(binDir, name), body, { mode: 0o755 });
+  };
+  writeExecutable("pnpm", `#!/usr/bin/env bash\nset -euo pipefail\nexit 0\n`);
+  writeExecutable(
+    "npm",
+    `#!/usr/bin/env bash
+set -euo pipefail
+[ "$*" = "install --omit=dev --ignore-scripts --no-audit --no-fund" ]
+dir="node_modules/@agentclientprotocol/codex-acp"
+mkdir -p "$dir/dist"
+printf '{"name":"@agentclientprotocol/codex-acp","version":"1.13.1"}\\n' > "$dir/package.json"
+printf 'stock runtime without the hook\\n' > "$dir/dist/index.js"
+`,
+  );
+  // A patch binary that silently leaves stock code behind must still fail the release.
+  writeExecutable("patch", `#!/usr/bin/env bash\nset -euo pipefail\nexit 0\n`);
+
+  assert.throws(
+    () =>
+      execFileSync(
+        process.execPath,
+        [
+          new URL("./prepare-bundled-package.mjs", import.meta.url).pathname,
+          sourceDir,
+          destinationDir,
+        ],
+        {
+          env: { ...process.env, PATH: `${binDir}:${process.env.PATH}` },
+          stdio: "pipe",
+        },
+      ),
+    /missing the network-access hook/,
+  );
 });
 
 test("bundled package dry runs preview without querying published versions", () => {
