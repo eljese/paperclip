@@ -1118,3 +1118,82 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
   });
 });
+
+(support.supported ? describe : describe.skip)("settled-hold operator re-drive (JES-232)", () => {
+  let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
+  let db: ReturnType<typeof createDb>;
+  beforeAll(async () => { database = await startEmbeddedPostgresTestDatabase("settled-redrive-"); db = createDb(database.connectionString); }, 30000);
+  afterAll(async () => { await database?.cleanup(); });
+
+  type Fixture = {
+    companyId: string; issueId: string; agentId: string; sourceRunId: string;
+    userCommentId: string; agentCommentId: string; operatorAgentId: string; successorRunId: string;
+  };
+  async function seedSettled(adapterType: string, holdStatus: "resolved" | "active"): Promise<Fixture> {
+    const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID();
+    const sourceRunId = randomUUID(), successorRunId = randomUUID();
+    const userCommentId = randomUUID(), agentCommentId = randomUUID(), operatorAgentId = randomUUID();
+    await db.insert(companies).values({ id: companyId, name: "Settled re-drive", defaultResponsibleUserId: "board", issuePrefix: `S${companyId.slice(0, 6)}` });
+    await db.insert(agents).values({ id: agentId, companyId, name: "Legacy", role: "engineer", adapterType, status: "idle", runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } });
+    await db.insert(agents).values({ id: operatorAgentId, companyId, name: "Operator", role: "manager", adapterType: "pi_local", status: "idle" });
+    await db.insert(issues).values({ id: issueId, companyId, title: "Stalled task", status: "todo", assigneeAgentId: agentId });
+    // Legacy remote run: terminal and finished, no process identity, no leases.
+    await db.insert(heartbeatRuns).values({ id: sourceRunId, companyId, agentId,
+      runtimeMode: "legacy", status: "interrupted",
+      contextSnapshot: { issueId }, startedAt: new Date("2026-09-11T09:00:00Z"),
+      finishedAt: new Date("2026-09-11T10:00:00Z") });
+    await db.insert(issueRecoveryActions).values({ companyId, sourceIssueId: issueId,
+      kind: "active_run_watchdog", cause: "legacy_execution_requires_reconciliation", fingerprint: sourceRunId,
+      status: holdStatus, outcome: holdStatus === "active" ? null : "blocked",
+      nextAction: "Automatic recovery stopped.",
+      evidence: { runId: sourceRunId, automaticRecovery: { replay: "blocked", actionOutcome: "unknown" } } });
+    await db.insert(issueComments).values({ id: userCommentId, companyId, issueId, authorType: "user",
+      authorUserId: "board", body: "Please continue with the correction.", createdAt: new Date("2026-09-11T11:00:00Z") });
+    await db.insert(issueComments).values({ id: agentCommentId, companyId, issueId, authorType: "agent",
+      authorAgentId: operatorAgentId, body: "Re-drive the correction now.", createdAt: new Date("2026-09-11T11:05:00Z") });
+    return { companyId, issueId, agentId, sourceRunId, userCommentId, agentCommentId, operatorAgentId, successorRunId };
+  }
+  function admitArgs(f: Fixture, over: Record<string, unknown> = {}) {
+    return {
+      db, companyId: f.companyId, issueId: f.issueId, agentId: f.agentId,
+      actorType: "user", actorId: "board", reason: "issue_commented",
+      commentId: f.userCommentId, successorRunId: f.successorRunId, dryRun: true, ...over,
+    };
+  }
+  it.each(["hermes_gateway", "pi_local", "codex_local"])("admits an explicit user turn past a settled hold on non-chat adapters (%s)", async (adapterType: string) => {
+    const f = await seedSettled(adapterType, "resolved");
+    await expect(admitExplicitNativeContinuation(admitArgs(f))).resolves.toMatchObject({ previousRunId: f.sourceRunId });
+  });
+  it("admits an agent re-drive comment with route-attested intent past a settled hold", async () => {
+    const f = await seedSettled("pi_local", "resolved");
+    await expect(admitExplicitNativeContinuation(admitArgs(f, {
+      actorType: "agent", actorId: f.operatorAgentId, commentId: f.agentCommentId, explicitOperatorRedrive: true,
+    }))).resolves.toMatchObject({ previousRunId: f.sourceRunId });
+  });
+  it("still defers an agent comment without route-attested intent", async () => {
+    const f = await seedSettled("pi_local", "resolved");
+    await expect(admitExplicitNativeContinuation(admitArgs(f, {
+      actorType: "agent", actorId: f.operatorAgentId, commentId: f.agentCommentId,
+    }))).resolves.toBeNull();
+  });
+  it("still defers non-chat adapters past an active hold", async () => {
+    const f = await seedSettled("hermes_gateway", "active");
+    await expect(admitExplicitNativeContinuation(admitArgs(f))).resolves.toBeNull();
+  });
+  it("dispatches a real wake past a settled hold for a user turn (pi_local)", async () => {
+    const f = await seedSettled("pi_local", "resolved");
+    const wake = await heartbeatService(db).wakeup(f.agentId, {
+      source: "automation", triggerDetail: "system", reason: "issue_commented",
+      requestedByActorType: "user", requestedByActorId: "board",
+      payload: { issueId: f.issueId, commentId: f.userCommentId, mutation: "comment" },
+      contextSnapshot: { issueId: f.issueId, taskId: f.issueId, commentId: f.userCommentId,
+        wakeCommentId: f.userCommentId, source: "issue.comment", wakeReason: "issue_commented" },
+    });
+    expect(wake).toBeTruthy();
+    const receipts = await db.select().from(agentWakeupRequests)
+      .where(and(eq(agentWakeupRequests.companyId, f.companyId), eq(agentWakeupRequests.agentId, f.agentId)));
+    expect(receipts.length).toBeGreaterThan(0);
+    expect(receipts.some((row: { status: string }) => row.status === "queued")).toBe(true);
+    expect(receipts.every((row: { status: string }) => row.status !== "deferred_issue_execution")).toBe(true);
+  });
+});
