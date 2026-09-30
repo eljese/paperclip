@@ -1,0 +1,44 @@
+{
+  "kind": "requirements-contract",
+  "schemaVersion": "1.0.0",
+  "deliveryId": "JES-000",
+  "sources": [
+    {
+      "ref": "issue JES-000 document prd revision 1",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000001"
+    }
+  ],
+  "scopeAuthority": {
+    "authority": "Ukko (factory CEO) within delegated authority, else Jesse via Ukko",
+    "approvalChannel": "issue thread + request_board_approval"
+  },
+  "releaseBoundary": {
+    "scope": "Example delivery scope",
+    "preReleaseBoundary": "All active mandatory pre-release requirements PASS",
+    "postDeploymentBoundary": "No post-deployment requirements in this example"
+  },
+  "requirements": [
+    {
+      "id": "JES-1",
+      "classification": "mandatory",
+      "behavior": "Example mandatory behavior",
+      "acceptanceCriteria": ["Behavior is observable in the candidate build"],
+      "sourceLocations": [
+        { "location": "PRD section 1", "excerpt": "The product must do the thing." }
+      ],
+      "planRefs": ["T1"],
+      "verificationMethod": "Inspect candidate build output for the thing",
+      "lifecycle": "active"
+    },
+    {
+      "id": "JES-2",
+      "classification": "advisory",
+      "behavior": "Example advisory behavior",
+      "acceptanceCriteria": ["Nice to have"],
+      "sourceLocations": [
+        { "location": "PRD section 2", "excerpt": "It would be nice if it also did the other thing." }
+      ],
+      "lifecycle": "active"
+    }
+  ]
+}
