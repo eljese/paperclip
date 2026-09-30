@@ -8,6 +8,9 @@
  * enforcement, this check is.
  *
  * Enforcement rules (PRD sections 7 + 8, plan T4):
+ *  - Final-checkpoint rule (JES-176 F-01a): `bindings.checkpoint` AND the
+ *    audit checkpoint must both be `"final"`. A plan-only audit (even a
+ *    clean one) HOLDs completion — plan approval never closes the parent.
  *  - Completion requires a full final PASS with NO partition: post-deployment
  *    requirements must now be PASS with evidence bound to the DEPLOYED
  *    artifact. Production-only pending blocks completion (HOLD) without
@@ -18,8 +21,10 @@
  *    candidate before execution blocks completion (AC-14).
  *  - Contract-only change invalidates old approval; plan change invalidates
  *    plan approval (AC-07) — enforced through the T2 validator bindings.
- *  - Intermediate work never completes the parent: `completionKind` must be
- *    `"parent"`; anything else is rejected, not passed through.
+ *  - Intermediate work never completes the parent: completion requires a
+ *    full final PASS bound to the deployed pinned SHA for the named
+ *    `parentDeliveryId`. There is no intermediate completion path through
+ *    this gate.
  *
  * Honest boundary (documented in `enforcement-integration.md`): this adapter
  * cannot hard-block the Paperclip issue-close API itself. Completion is
@@ -102,6 +107,29 @@ export function evaluateCompletionGate(inputs: CompletionGateInputs): Completion
       "completion.pinned_binding_mismatch",
       "pinned candidate SHA does not match the authoritative approval binding (fresh approval required)",
     );
+  }
+
+  // Final-checkpoint rule (JES-176 F-01a): plan approval never closes the
+  // parent. Both the authoritative bindings and the audit itself must be
+  // final; validator failures below are still collected so existing case
+  // codes keep reporting alongside the checkpoint block.
+  if (inputs.bindings.checkpoint !== "final") {
+    push(
+      "completion.checkpoint_not_final",
+      `completion requires final approval: authoritative checkpoint is ${JSON.stringify(inputs.bindings.checkpoint)} (plan approval never closes the parent)`,
+    );
+  }
+  try {
+    const auditCheckpoint = (JSON.parse(inputs.auditText) as { checkpoint?: unknown }).checkpoint;
+    if (auditCheckpoint !== "final") {
+      push(
+        "completion.audit_checkpoint_not_final",
+        `completion requires a final audit: audit checkpoint is ${JSON.stringify(auditCheckpoint)}`,
+      );
+    }
+  } catch {
+    // Unparseable audit text is already a validator case-2 failure; the
+    // eligibility run below records it. No extra block here.
   }
 
   // No partition at completion: every due mandatory requirement — including

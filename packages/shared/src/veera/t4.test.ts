@@ -428,11 +428,64 @@ describe("veera completion gate (controlled parent-delivery path)", () => {
   });
 });
 
+describe("veera final-checkpoint rule (JES-176 F-01a)", () => {
+  const planHash = "d".repeat(64);
+  // A *clean* plan audit: plan refs match, findings PASS with evidence,
+  // trusted publisher, passing gates. Before the fix this authorized
+  // release and completion; plan approval must never do either.
+  const cleanPlan = {
+    bindings: {
+      checkpoint: "plan" as const,
+      repo: undefined,
+      candidateSha: undefined,
+      planRevision: "rev-1",
+      planHash,
+      gates: {
+        rehti: { verdict: "CLEAN", headSha: CAND_A },
+        qa: { verdict: "PASS", headSha: CAND_A },
+      },
+    },
+    audit: {
+      checkpoint: "plan" as const,
+      candidate: undefined,
+      planRef: { planRevision: "rev-1", planHash },
+    },
+  };
+
+  it("clean plan audit HOLDs scoped release (plan approval never deploys)", () => {
+    const result = evaluateReleaseGate(releaseFixture(cleanPlan));
+    expect(result.verdict).toBe("HOLD");
+    expect(result.blocks.some((b) => b.code === "release.checkpoint_not_final")).toBe(true);
+    expect(result.gatedSha).toBeNull();
+  });
+
+  it("clean plan audit HOLDs parent completion", () => {
+    const result = evaluateCompletionGate(completionFixture(cleanPlan));
+    expect(result.verdict).toBe("HOLD");
+    expect(result.blocks.some((b) => b.code === "completion.checkpoint_not_final")).toBe(true);
+  });
+
+  it("plan audit HOLDs release even with final bindings", () => {
+    const result = evaluateReleaseGate(
+      releaseFixture({ audit: { checkpoint: "plan" as const, candidate: undefined } }),
+    );
+    expect(result.verdict).toBe("HOLD");
+    expect(result.blocks.some((b) => b.code === "release.audit_checkpoint_not_final")).toBe(true);
+    expect(result.gatedSha).toBeNull();
+  });
+});
+
 describe("veera real command wiring (AC-10)", () => {
   it("scripts/release.sh invokes the Veera pre-deployment gate", () => {
     const releaseSh = readFileSync(join(REPO_ROOT, "scripts", "release.sh"), "utf-8");
     expect(releaseSh).toContain("veera-gate.mjs");
     expect(releaseSh).toContain("VEERA_DELIVERY_ID");
+  });
+
+  it("scripts/release.sh passes intermediate NOT_APPLICABLE through without a gated SHA (JES-176 F-01b)", () => {
+    const releaseSh = readFileSync(join(REPO_ROOT, "scripts", "release.sh"), "utf-8");
+    expect(releaseSh).toContain("verdict: NOT_APPLICABLE");
+    expect(releaseSh).toContain("existing gates apply");
   });
 
   it("veera-gate.mjs fails closed on missing evidence files (exit 2)", () => {

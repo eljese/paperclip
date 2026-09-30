@@ -41,8 +41,10 @@ enforcement; the entry points below reject.
 **Real operation:** `evaluateCompletionGate`
 (`packages/shared/src/veera/completion-gate.ts`), run as
 `node scripts/veera-gate.mjs --mode completion --parent-delivery <id>
---deployed <sha> [--pinned <sha>]` with the same contract/audit/bindings
-inputs. The delivery owner (Ahti-CTO) must obtain a PASS verdict BEFORE
+--deployed <sha> --pinned <sha>` with the same contract/audit/bindings
+inputs (`--pinned` may instead come from the `VEERA_PINNED_SHA` env; one of
+the two is required — the impl fails closed with exit 2 when neither is
+set). The delivery owner (Ahti-CTO) must obtain a PASS verdict BEFORE
 closing the parent delivery issue (`PATCH /api/issues/{id}` → `done`).
 
 - Completion requires a FULL final PASS with no partition: post-deployment
@@ -54,6 +56,12 @@ closing the parent delivery issue (`PATCH /api/issues/{id}` → `done`).
 - Contract-only change invalidates old approval; plan change invalidates plan
   approval (AC-07) — enforced through the validator bindings, tested through
   these gates.
+- Plan approval never releases or completes (JES-176 F-01a): both gates HOLD
+  unless `bindings.checkpoint` and the audit checkpoint are `"final"`.
+  A clean plan audit authorizes nothing.
+- Intermediate releases (JES-176 F-01b) return `NOT_APPLICABLE` (exit 0, no
+  `VEERA_GATED_SHA` line); `release.sh` detects that verdict and skips the
+  gated-SHA demand and the pre-tag re-check.
 
 ## 3. Permissions
 
