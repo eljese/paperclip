@@ -68,7 +68,7 @@ closing the parent delivery issue (`PATCH /api/issues/{id}` → `done`).
 | Step | Who | How |
 |---|---|---|
 | Set gate env + run `release.sh` | Vaka-Release (release authority) / engineer merging | Existing release authority; gate inputs from the authoritative delivery record |
-| Trusted publisher attestation (`VEERA_PUBLISHER_ID` + `..._AUTHENTICATED=1`) | Protected publisher / CI identity only | Until the board names the trusted publisher (T1 blocker B3), the allowlist stays empty for real deliveries and the gate FAILS CLOSED (case 7) |
+| Trusted publisher attestation (`VEERA_PUBLISHER_ID` + `..._AUTHENTICATED=1`) | Protected publisher / CI identity only | Board-named prod publisher ([JES-179](/JES/issues/JES-179), B3): `vaka-release`. Bindings allowlist MUST be exactly `["vaka-release"]`; any other publisher id FAILS CLOSED (case 7, `publisher.untrusted`). Delivery-record values predating the board decision carry no trust on their own. |
 | Scope amendments | Ukko within delegated authority, else Jesse (`local-board`) | Authenticated issue thread + `request_board_approval`; bare `approved_by` strings rejected (case 6) |
 | Run completion gate + close parent | Ahti-CTO (delivery close owner) | PASS verdict required first (controlled procedure) |
 | Correction budget | Ahti-CTO ledger (attempt-zero + max 2 automatic; 3rd via Jesse/Ukko) | Shared delivery-level budget; exhaustion escalates, never flips HOLD to PASS |
@@ -94,8 +94,11 @@ are NOT prevented by this task:
    hand-set by the release requester.
 4. **Fork `master` unprotected + 0 check-runs on fork PRs** (T1 findings
    F1/F2): Rehti/QA gate inputs for fork candidates currently have no
-   required-check set to verify against. Until the board resolves B1/B3 and
-   required checks exist, treat fork releases as gated on Veera evidence
+   required-check set to verify against. The board resolved B1/B3 on
+   [JES-179](/JES/issues/JES-179): production target is the current landing
+   (`github.com/eljese/paperclip` `master`) declared final, and the prod
+   trusted publisher is `vaka-release`. Until required checks exist, treat
+   fork releases as gated on Veera evidence
    only, and record which technical gates were actually verified.
 
 ## 5. Operator quick reference
