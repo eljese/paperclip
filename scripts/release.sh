@@ -262,6 +262,41 @@ if [ "$channel" = "stable" ]; then
   release_info "  Release notes: $NOTES_FILE"
 fi
 
+# Veera pre-deployment gate (JES-149, PRD section 8 integration). When this
+# release carries a Veera-scoped delivery's committed scope (VEERA_DELIVERY_ID
+# set by the release owner, e.g. Vaka-Release), eligibility is enforced through
+# the real gate entry point BEFORE any build or publish. VEERA_DELIVERY_ID
+# unset = no scoped delivery = existing flow unchanged. Any gate failure —
+# including missing evidence files or a moved candidate SHA — blocks release.
+# Required env when active: VEERA_CONTRACT_PATH, VEERA_AUDIT_PATH,
+# VEERA_BINDINGS_PATH, VEERA_PINNED_SHA, VEERA_PUBLISHER_ID, plus
+# VEERA_PUBLISHER_AUTHENTICATED=1 from the protected publisher/CI context.
+# Optional: VEERA_RELEASE_KIND (scoped|intermediate, default scoped),
+# VEERA_RELEASE_REPO, VEERA_DEPLOY_SHA, VEERA_POST_REQ_IDS.
+VEERA_GATED_SHA=""
+if [ -n "${VEERA_DELIVERY_ID:-}" ]; then
+  release_info ""
+  release_info "==> Veera pre-deployment gate (delivery $VEERA_DELIVERY_ID)..."
+  VEERA_GATE_OUTPUT="$(node "$REPO_ROOT/scripts/veera-gate.mjs" --mode release 2>&1)" || {
+    printf '%s\n' "$VEERA_GATE_OUTPUT"
+    release_fail "Veera release gate blocked this release (see gate output above)."
+  }
+  printf '%s\n' "$VEERA_GATE_OUTPUT"
+  # Intermediate releases (JES-176 F-01b) return NOT_APPLICABLE with exit 0
+  # and no VEERA_GATED_SHA line: they progress under existing technical
+  # gates and are never a Veera approval, so no SHA is demanded and the
+  # pre-tag re-check below is skipped (VEERA_GATED_SHA stays empty).
+  if printf '%s\n' "$VEERA_GATE_OUTPUT" | grep -q "verdict: NOT_APPLICABLE"; then
+    release_info "  ✓ Veera gate not applicable (intermediate; existing gates apply)"
+  else
+    VEERA_GATED_SHA="$(printf '%s\n' "$VEERA_GATE_OUTPUT" | sed -n 's/^VEERA_GATED_SHA=//p' | tail -n 1)"
+    case "$VEERA_GATED_SHA" in
+      ????????????????????????????????????????) release_info "  ✓ Veera gate passed for pinned $VEERA_GATED_SHA" ;;
+      *) release_fail "Veera gate passed but did not report a gated SHA (refusing to proceed)." ;;
+    esac
+  fi
+fi
+
 set_cleanup_trap
 
 # The release flow already prepares ui/dist before packaging. Reuse that output
@@ -460,6 +495,17 @@ if [ "$dry_run" = true ]; then
   release_info "==> Step 7/7: Dry run complete..."
 else
   release_info "==> Step 7/7: Creating git tag..."
+  # Veera re-check immediately before release (JES-149, AC-14): the tagged
+  # commit must still be the gated pinned SHA. A branch that moved after the
+  # pre-deployment gate blocks tagging instead of shipping new HEAD under
+  # old evidence.
+  if [ -n "$VEERA_GATED_SHA" ]; then
+    VEERA_TAG_HEAD="$(git -C "$REPO_ROOT" rev-parse HEAD)"
+    if [ "$VEERA_TAG_HEAD" != "$VEERA_GATED_SHA" ] || [ "$CURRENT_SHA" != "$VEERA_GATED_SHA" ]; then
+      release_fail "Veera re-check failed: HEAD moved after the gate (HEAD=$VEERA_TAG_HEAD, gated=$VEERA_GATED_SHA). Fresh approval required."
+    fi
+    release_info "  ✓ Veera re-check: HEAD still pinned at $VEERA_GATED_SHA"
+  fi
   git -C "$REPO_ROOT" tag "$tag_name" "$CURRENT_SHA"
   release_info "  ✓ Created tag $tag_name on $CURRENT_SHA"
 fi
