@@ -282,11 +282,19 @@ if [ -n "${VEERA_DELIVERY_ID:-}" ]; then
     release_fail "Veera release gate blocked this release (see gate output above)."
   }
   printf '%s\n' "$VEERA_GATE_OUTPUT"
-  VEERA_GATED_SHA="$(printf '%s\n' "$VEERA_GATE_OUTPUT" | sed -n 's/^VEERA_GATED_SHA=//p' | tail -n 1)"
-  case "$VEERA_GATED_SHA" in
-    ????????????????????????????????????????) release_info "  ✓ Veera gate passed for pinned $VEERA_GATED_SHA" ;;
-    *) release_fail "Veera gate passed but did not report a gated SHA (refusing to proceed)." ;;
-  esac
+  # Intermediate releases (JES-176 F-01b) return NOT_APPLICABLE with exit 0
+  # and no VEERA_GATED_SHA line: they progress under existing technical
+  # gates and are never a Veera approval, so no SHA is demanded and the
+  # pre-tag re-check below is skipped (VEERA_GATED_SHA stays empty).
+  if printf '%s\n' "$VEERA_GATE_OUTPUT" | grep -q "verdict: NOT_APPLICABLE"; then
+    release_info "  ✓ Veera gate not applicable (intermediate; existing gates apply)"
+  else
+    VEERA_GATED_SHA="$(printf '%s\n' "$VEERA_GATE_OUTPUT" | sed -n 's/^VEERA_GATED_SHA=//p' | tail -n 1)"
+    case "$VEERA_GATED_SHA" in
+      ????????????????????????????????????????) release_info "  ✓ Veera gate passed for pinned $VEERA_GATED_SHA" ;;
+      *) release_fail "Veera gate passed but did not report a gated SHA (refusing to proceed)." ;;
+    esac
+  fi
 fi
 
 set_cleanup_trap

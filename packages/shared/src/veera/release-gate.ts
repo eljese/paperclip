@@ -6,6 +6,9 @@
  * exercise this gate — not just the T2 validator underneath.
  *
  * Enforcement rules (PRD section 8 + plan T4):
+ *  - Final-checkpoint rule (JES-176 F-01a): `bindings.checkpoint` AND the
+ *    audit checkpoint must both be `"final"`. A plan-only audit (even a
+ *    clean one) HOLDs release — plan approval never authorizes deployment.
  *  - Pinned-SHA re-check: the SHA observed immediately before release
  *    (`actualHeadSha`, resolved from git at gate time) must equal the approved
  *    pinned candidate SHA AND the authoritative `bindings.candidateSha`.
@@ -141,6 +144,31 @@ export function evaluateReleaseGate(inputs: ReleaseGateInputs): ReleaseGateResul
         "intermediate release: existing technical gates apply; Veera full acceptance still blocks parent close and scoped release",
       ],
     };
+  }
+
+  // Final-checkpoint rule (JES-176 F-01a): plan approval never authorizes
+  // release. The validator only binds candidate SHA/evidence at the final
+  // checkpoint, so a clean plan audit would otherwise PASS here. Both the
+  // authoritative bindings and the audit itself must be final.
+  if (inputs.bindings.checkpoint !== "final") {
+    block(
+      blocks,
+      "release.checkpoint_not_final",
+      `release requires final approval: authoritative checkpoint is ${JSON.stringify(inputs.bindings.checkpoint)} (plan approval never authorizes deployment)`,
+    );
+  }
+  try {
+    const auditCheckpoint = (JSON.parse(inputs.auditText) as { checkpoint?: unknown }).checkpoint;
+    if (auditCheckpoint !== "final") {
+      block(
+        blocks,
+        "release.audit_checkpoint_not_final",
+        `release requires a final audit: audit checkpoint is ${JSON.stringify(auditCheckpoint)}`,
+      );
+    }
+  } catch {
+    // Unparseable audit text is already a validator case-2 failure; the
+    // eligibility run below records it. No extra block here.
   }
 
   // Pinned-SHA re-check (AC-14): format first, then equality. Every mismatch
