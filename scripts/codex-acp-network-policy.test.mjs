@@ -9,7 +9,11 @@ const source = readFileSync(require.resolve("@agentclientprotocol/codex-acp"), "
 const helperStart = source.indexOf("function paperclipSandboxPolicy(");
 const helperEnd = source.indexOf("\nvar CodexAcpClient", helperStart);
 const methodStart = source.indexOf("  async sendPrompt(");
-const methodEnd = source.indexOf("\n  async runAgentFileChangeReport", methodStart);
+// The method following sendPrompt moved upstream (1.6.2: runAgentFileChangeReport; 1.13.1: setCollaborationMode).
+const methodFollowers = ["\n  async runAgentFileChangeReport", "\n  async setCollaborationMode"];
+const methodEnd = Math.min(
+  ...methodFollowers.map((anchor) => source.indexOf(anchor, methodStart)).filter((index) => index > methodStart),
+);
 assert.ok(helperStart >= 0 && helperEnd > helperStart, "installed Codex ACP must contain the network policy patch");
 assert.ok(methodStart >= 0 && methodEnd > methodStart, "installed Codex ACP must expose the patched turn boundary");
 

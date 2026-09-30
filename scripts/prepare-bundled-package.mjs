@@ -295,6 +295,25 @@ export function prepareBundledPackage(sourceDir, destinationDir, { sourceRoot = 
     }
   }
 
+  if (bundledDependencies.includes("@agentclientprotocol/codex-acp")) {
+    // Fail closed: the sandboxed ACP lane depends on the repository's
+    // network-access hook (paperclipSandboxPolicy) inside the vendored
+    // codex-acp runtime. A version bump without a rebased pnpm patch must
+    // break the release here, never reship stock code with networkAccess=false.
+    const codexAcpDist = readFileSync(
+      resolve(destinationDir, "node_modules/@agentclientprotocol/codex-acp/dist/index.js"),
+      "utf8",
+    );
+    if (
+      !codexAcpDist.includes("function paperclipSandboxPolicy(") ||
+      !codexAcpDist.includes("PAPERCLIP_CODEX_ACP_NETWORK_ACCESS")
+    ) {
+      throw new Error(
+        "staged @agentclientprotocol/codex-acp runtime is missing the network-access hook",
+      );
+    }
+  }
+
   if (bundledDependencies.includes("embedded-postgres")) {
     const embeddedPostgresSource = readFileSync(
       resolve(destinationDir, "node_modules/embedded-postgres/dist/index.js"),
