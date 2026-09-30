@@ -1189,11 +1189,19 @@ const support = await getEmbeddedPostgresTestSupport();
       contextSnapshot: { issueId: f.issueId, taskId: f.issueId, commentId: f.userCommentId,
         wakeCommentId: f.userCommentId, source: "issue.comment", wakeReason: "issue_commented" },
     });
-    expect(wake).toBeTruthy();
+    // wakeup() returns the queued successor run synchronously. The
+    // in-process executor may claim the receipt and start the run before the
+    // assertions below execute, so receipt status is "queued" or "claimed"
+    // depending on timing; neither defers past the settled hold.
+    expect(wake).toMatchObject({ status: "queued" });
     const receipts = await db.select().from(agentWakeupRequests)
       .where(and(eq(agentWakeupRequests.companyId, f.companyId), eq(agentWakeupRequests.agentId, f.agentId)));
     expect(receipts.length).toBeGreaterThan(0);
-    expect(receipts.some((row: { status: string }) => row.status === "queued")).toBe(true);
+    expect(receipts.some((row: { status: string }) => row.status === "queued" || row.status === "claimed")).toBe(true);
     expect(receipts.every((row: { status: string }) => row.status !== "deferred_issue_execution")).toBe(true);
+    const receiptIds = new Set(receipts.map((row: { id: string }) => row.id));
+    const successors = await db.select().from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.companyId, f.companyId), eq(heartbeatRuns.agentId, f.agentId)));
+    expect(successors.some((run: { id: string; wakeupRequestId: string | null }) => run.id !== f.sourceRunId && run.wakeupRequestId !== null && receiptIds.has(run.wakeupRequestId))).toBe(true);
   });
 });
