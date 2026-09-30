@@ -34,6 +34,11 @@ human approval, decline, or scoped remembered permission. Connections and task
 views resolve the same review, and the agent continues with the server-recorded
 outcome. See [the implementation contract](SPEC-implementation.md#124-connection-tool-reviews).
 
+Model authentication failures also surface a provider-specific Connections card
+on the task immediately after failure. Users can reconnect inline and resume;
+legacy agents keep their authentication until an explicit, validated adoption.
+See [AI Connections](connections/AI-CONNECTIONS.md).
+
 #### Board Powers (Always Available)
 
 The Board has **unrestricted access** to the entire system at all times:
@@ -282,7 +287,7 @@ All agent communication flows through the **task system**.
 
 There is no separate messaging or chat system. Tasks are the communication channel. This keeps all context attached to the work it relates to and creates a natural audit trail.
 
-Experimental Agent Chat presents one persistent task per person and agent as a simplified conversation. It retains the task composer, transcript, tools, attachments, documents, and existing Subtasks panel, with ordinary company visibility. New execution tasks are ordinary project tasks, not children of the conversation. Idle conversations wait for a message without entering execution-task work queues. Agents clarify goals here and create assigned tasks for substantial execution. `/new` resets provider context at an ordered session boundary within the same task while preserving visible history. `enableAgentChat` is disabled by default; the V1 lifecycle and rollout contract is specified in `SPEC-implementation.md`.
+Experimental Agent Chat presents one persistent task per person and agent as a simplified conversation. Chat has a searchable secondary sidebar with agent avatars; adding an agent starts or reopens their single conversation. It retains the task composer, transcript, tools, attachments, documents, and existing Subtasks panel, with ordinary company visibility. New execution tasks are ordinary project tasks, not children of the conversation. Idle conversations wait for a message without entering execution-task work queues. Agents clarify goals here and create assigned tasks for substantial execution. `/new` resets provider context at an ordered session boundary within the same task while preserving visible history. `enableAgentChat` is disabled by default; the V1 lifecycle and rollout contract is specified in `SPEC-implementation.md`.
 
 ### Implications
 
