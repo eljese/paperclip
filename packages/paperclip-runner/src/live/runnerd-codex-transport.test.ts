@@ -7334,7 +7334,12 @@ it("preserves prepared input through runnerd and the real OpenCode proxy boundar
     expect(requests.map((request) => request.parts)).toEqual([[{ type: "text", text: prepared }]]);
   } finally {
     await session?.close();
-    await bundle.transport.close();
+    // The transport memoizes its close promise: when session open fails, a
+    // bare re-close rethrows the fail-closed suspension error and masks the
+    // original open failure. Preserve the authoritative error in each case.
+    await bundle.transport.close().catch((closeError: unknown) => {
+      if (session !== undefined) throw closeError;
+    });
     await rm(root, { recursive: true, force: true });
   }
 }, 30_000);
