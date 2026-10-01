@@ -11,5 +11,7 @@ permissions:
 jobs:
   ci:
     # Master requires CODEOWNERS review for .github/**, including this workflow.
-    # The AWS runner group permits pr-trusted.yml@refs/heads/master.
-    uses: paperclipai/paperclip/.github/workflows/pr-trusted.yml@master
+    # JES-287 (board: local-caller): call the head-side reusable workflow so the
+    # sync-branch gate fixes on this branch take effect for PR #16. Revert to
+    # paperclipai/paperclip/.github/workflows/pr-trusted.yml@master after merge.
+    uses: ./.github/workflows/pr-trusted.yml
