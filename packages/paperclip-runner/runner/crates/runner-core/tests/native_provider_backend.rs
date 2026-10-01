@@ -15,7 +15,6 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 const CODEX_ACPX_DIGEST: &str =
-const CODEX_ACPX_DIGEST: &str =
     "sha256:1592222a87fe2d4cf36fa6b05cc6aa2d8f3ce47ab7c498b7a46649905573357c";
 const PI_ACPX_DIGEST: &str =
     "sha256:8c696f38296d53d0061fa11534570c5ddd951b63532aed30e0f1fcc676dc169f";
