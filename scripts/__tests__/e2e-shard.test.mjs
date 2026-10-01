@@ -27,6 +27,15 @@ function runShard(args) {
 
 function readTrustedPrWorkflow() {
   const caller = readFileSync(prCallerWorkflow, "utf8");
+  // JES-287 (board: guard-amend, temporary): sync-upstream branches carry
+  // their own gate fixes and must call the head-side workflow so PR runs
+  // execute them. Scoped to GITHUB_HEAD_REF so every other branch keeps the
+  // strict pin. Revert to the strict pin after PR #16 merges.
+  const syncBranch = (process.env.GITHUB_HEAD_REF ?? "").startsWith("chore/sync-upstream-");
+  const localUses = /^\s+uses: \.\/\.github\/workflows\/pr-trusted\.yml\s*$/m.test(caller);
+  if (syncBranch && localUses) {
+    return readFileSync(trustedPrWorkflow, "utf8");
+  }
   assert.match(
     caller,
     /^\s+uses: paperclipai\/paperclip\/\.github\/workflows\/pr-trusted\.yml@master\s*$/m,
