@@ -266,8 +266,10 @@ jobs:
           fetch-depth: 0
 
       - name: Block manual lockfile edits
+        # Sync-upstream branches carry upstream's own lockfile delta by design.
         if: >-
           github.head_ref != 'chore/refresh-lockfile' &&
+          !startsWith(github.head_ref, 'chore/sync-upstream-') &&
           github.event.pull_request.user.login != 'dependabot[bot]'
         run: |
           # Diff the PR branch against its merge base so recent base-branch commits
@@ -735,6 +737,14 @@ jobs:
           NPM_CONFIG_UPDATE_NOTIFIER: "false"
         with:
           version: 9.15.4
+
+      - name: Normalize Node binary permissions for runnerd launch checks
+        run: |
+          # GH runner images ship the toolcache Node group/world-writable; runnerd
+          # rejects group-writable provider commands (qualified-launch check), which
+          # fails the runner vitest lanes. See JES-227 / PR #16 run 36869414735.
+          sudo chmod g-w,o-w "$(command -v node)"
+          stat -c '%A %n' "$(command -v node)"
 
       # Share the checked-in lockfile key with master. PR merge refs must not
       # save full copies of the store or evict the post-merge build caches.
