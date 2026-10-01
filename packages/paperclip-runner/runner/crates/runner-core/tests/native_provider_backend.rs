@@ -15,7 +15,8 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 const CODEX_ACPX_DIGEST: &str =
-    "sha256:c4538599d1ab767db5dff50934f13bb5ba313a59d9c4a83e993fac4617ea63d3";
+const CODEX_ACPX_DIGEST: &str =
+    "sha256:1592222a87fe2d4cf36fa6b05cc6aa2d8f3ce47ab7c498b7a46649905573357c";
 const PI_ACPX_DIGEST: &str =
     "sha256:8c696f38296d53d0061fa11534570c5ddd951b63532aed30e0f1fcc676dc169f";
 
@@ -182,7 +183,7 @@ fn prepare_payload(directory: &Path, agent: &str) -> Value {
 fn prepare_payload_with_mode(directory: &Path, agent: &str, mode: &str) -> Value {
     let operations = Vec::new();
     let (runtime_package, runtime_version) = if agent == "codex" {
-        (json!("@openai/codex"), json!("0.156.0"))
+        (json!("@openai/codex"), json!("0.156.1"))
     } else {
         (Value::Null, Value::Null)
     };
@@ -202,7 +203,7 @@ fn prepare_payload_with_mode(directory: &Path, agent: &str, mode: &str) -> Value
             "model": "gpt-5.6-sol",
             "acpxVersion": "0.13.1",
             "agentServerPackage": "@agentclientprotocol/codex-acp",
-            "agentServerVersion": "1.6.2",
+            "agentServerVersion": "1.13.1",
             "agentRuntimePackage": runtime_package,
             "agentRuntimeVersion": runtime_version,
             "commandDigest": CODEX_ACPX_DIGEST,

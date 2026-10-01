@@ -159,10 +159,10 @@ impl AcpxProviderDescriptor {
             "codex" => (
                 "gpt-5.6-sol",
                 "@agentclientprotocol/codex-acp",
-                "1.6.2",
+                "1.13.1",
                 Some("@openai/codex"),
-                Some("0.156.0"),
-                "sha256:c4538599d1ab767db5dff50934f13bb5ba313a59d9c4a83e993fac4617ea63d3",
+                Some("0.156.1"),
+                "sha256:1592222a87fe2d4cf36fa6b05cc6aa2d8f3ce47ab7c498b7a46649905573357c",
             ),
             "pi" => (
                 "openrouter/deepseek/deepseek-v4-flash-0731",
@@ -2252,10 +2252,10 @@ mod tests {
                 (
                     "gpt-5.6-sol",
                     "@agentclientprotocol/codex-acp",
-                    "1.6.2",
+                    "1.13.1",
                     json!("@openai/codex"),
-                    json!("0.156.0"),
-                    "sha256:c4538599d1ab767db5dff50934f13bb5ba313a59d9c4a83e993fac4617ea63d3",
+                    json!("0.156.1"),
+                    "sha256:1592222a87fe2d4cf36fa6b05cc6aa2d8f3ce47ab7c498b7a46649905573357c",
                 )
             };
         json!({

@@ -21,7 +21,7 @@ const acpxPatch = await readFile(
 );
 const codexPatch = await readFile(
   new URL(
-    "../../../patches/@agentclientprotocol__codex-acp@1.6.2.patch",
+    "../../../patches/@agentclientprotocol__codex-acp@1.13.1.patch",
     import.meta.url,
   ),
   "utf8",
@@ -57,16 +57,18 @@ const nativeSessionExecutor = await readFile(
 );
 
 test("the runner pins every qualified ACPX production dependency", () => {
-  assert.equal(runnerPackage.dependencies["@openai/codex"], "0.156.0");
+  assert.equal(runnerPackage.dependencies["@openai/codex"], "0.156.1");
   assert.equal(runnerPackage.dependencies["@anthropic-ai/claude-agent-sdk"], undefined);
-  assert.equal(rootPackage.pnpm.overrides["@agentclientprotocol/codex-acp@1.6.2>@openai/codex"], runnerPackage.dependencies["@openai/codex"]);
+  // codex-acp 1.13.1 depends on @openai/codex ^0.156.1, which already resolves
+  // to the runner's exact 0.156.1 pin, so no codex-acp override remains.
+  assert.equal(rootPackage.pnpm.overrides["@agentclientprotocol/codex-acp@1.6.2>@openai/codex"], undefined);
   assert.equal(rootPackage.pnpm.overrides["@agentclientprotocol/claude-agent-acp@0.73.0>@anthropic-ai/claude-agent-sdk"], "0.3.280");
   assert.equal(runnerPackage.optionalDependencies, undefined);
   assert.equal(runnerPackage.dependencies.node, undefined);
   assert.equal(runnerPackage.dependencies.acpx, "0.13.1");
   assert.equal(
     runnerPackage.dependencies["@agentclientprotocol/codex-acp"],
-    "1.6.2",
+    "1.13.1",
   );
   assert.equal(
     runnerPackage.dependencies["@agentclientprotocol/claude-agent-acp"],
@@ -123,14 +125,14 @@ test("old and new pnpm configuration both apply the exact runtime patches", () =
   );
   assert.equal(
     rootPackage.pnpm.patchedDependencies[
-      "@agentclientprotocol/codex-acp@1.6.2"
+      "@agentclientprotocol/codex-acp@1.13.1"
     ],
-    "patches/@agentclientprotocol__codex-acp@1.6.2.patch",
+    "patches/@agentclientprotocol__codex-acp@1.13.1.patch",
   );
   assert.match(workspace, /acpx@0\.13\.1: patches\/acpx@0\.13\.1\.patch/);
   assert.match(
     workspace,
-    /codex-acp@1\.6\.2["']: patches\/@agentclientprotocol__codex-acp@1\.6\.2\.patch/,
+    /codex-acp@1\.13\.1["']: patches\/@agentclientprotocol__codex-acp@1\.13\.1\.patch/,
   );
   assert.match(
     workspace,
@@ -142,7 +144,9 @@ test("old and new pnpm configuration both apply the exact runtime patches", () =
     providerPackBuilder,
     /copyFileSync\(process\.execPath, stableNodeCommand\)/,
   );
-  assert.match(codexPatch, /\+    "@openai\/codex": "0\.156\.0"/);
+  assert.match(codexPatch, /function paperclipSandboxPolicy\(/);
+  assert.match(codexPatch, /PAPERCLIP_CODEX_ACP_NETWORK_ACCESS/);
+  assert.match(codexPatch, /paperclipSandboxPolicy\(agentMode\.sandboxPolicy\)/);
 });
 
 test("the ACPX patch preserves launch-only state and verified spawning", () => {
@@ -200,26 +204,20 @@ test("authentication rejects invalid isolated environments without host fallback
   assert.match(addedSource, /resolveAgentEnvironment\(this\.options\.spawnEnvironment\)\)\.XAI_API_KEY/);
 });
 
-test("the Codex patch enforces isolated instructions, tools, and skills", () => {
+test("the Codex patch carries only the network-access hook", () => {
+  // The 1.13.1 rebase (JES-204) carries only paperclipSandboxPolicy; the
+  // pre-rebase isolation/elicitation hunks are not part of this patch.
   for (const token of [
-    "PAPERCLIP_ACPX_ISOLATED_CONTEXT",
-    "baseInstructions",
-    "rawInput: { serverName: params.serverName }",
-    '"features.apps": false',
-    "process.env.CODEX_HOME",
+    "function paperclipSandboxPolicy(",
+    "PAPERCLIP_CODEX_ACP_NETWORK_ACCESS",
+    "PAPERCLIP_RUNNER_NETWORK_ACCESS",
+    "paperclipSandboxPolicy(agentMode.sandboxPolicy)",
   ]) {
     assert.match(
       codexPatch,
       new RegExp(token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
     );
   }
-});
-
-test("the Codex patch keeps MCP tool approvals on the governed permission channel", () => {
-  assert.match(
-    codexPatch,
-    /!context\.isToolApproval && this\.shouldUseAcpElicitation\(params\)/,
-  );
 });
 
 test("the Claude patch removes ambient project and local configuration", () => {

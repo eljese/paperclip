@@ -92,7 +92,7 @@ const RUNNERD_FACADE_PROFILES = [
         agent: "codex",
         agentProfileVersion: 1,
         agentServerPackage: "@agentclientprotocol/codex-acp",
-        agentServerVersion: "1.6.2",
+        agentServerVersion: "1.13.1",
         agentRuntimePackage: null,
         agentRuntimeVersion: null,
         commandDigest: `sha256:${"b".repeat(64)}`,

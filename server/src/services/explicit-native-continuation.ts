@@ -77,16 +77,34 @@ export async function admitExplicitNativeContinuation(input: {
   queuedCommentInterruptId?: string;
   /** Internal delivery of an unconsumed, user-authored legacy queue entry. */
   queuedCommentRequestId?: string;
+  /**
+   * Route-attested explicit operator re-drive: an agent author posted with
+   * resume/reopen intent, or the wake follows an operator reassignment.
+   * Only ever admits a fresh turn past a SETTLED hold (never a replay, never
+   * past an active hold). Without it, agent-authored wakes keep deferring.
+   */
+  explicitOperatorRedrive?: boolean;
   dryRun?: boolean;
   onBlocked?: (reason: string, message: string) => void;
 }): Promise<{ previousRunId: string; commentId: string | null; failedRunId?: string } | null> {
   const { db, companyId, issueId, agentId, actorId, commentId } = input;
   const blocked = (reason: string, message: string) => { input.onBlocked?.(reason, message); return null; };
-  if (input.actorType !== "user" || !actorId) return null;
+  // An agent author only qualifies with route-attested explicit re-drive
+  // intent (resume/reopen comment or operator reassignment). Anything else
+  // keeps deferring, exactly as before.
+  const operatorRedrive = input.explicitOperatorRedrive === true &&
+    input.actorType === "agent" && Boolean(actorId);
+  if ((input.actorType !== "user" || !actorId) && !operatorRedrive) return null;
+  if (!actorId) return null;
   const retry = input.reason === "retry_failed_run" &&
     z.string().guid().safeParse(input.failedRunId).success;
-  if (!retry && !input.queuedCommentInterruptId && (!commentId || !z.string().guid().safeParse(commentId).success ||
-      !["issue_commented", "issue_reopened_via_comment"].includes(input.reason ?? ""))) return null;
+  const commentBoundWake = Boolean(commentId && z.string().guid().safeParse(commentId).success &&
+      ["issue_commented", "issue_reopened_via_comment"].includes(input.reason ?? ""));
+  // Reassignment wakes are authorized by the operator reassignment itself,
+  // verified below via assignee match and settled hold. A carried comment, if
+  // any, is still bound to its author.
+  const reassignmentRedrive = operatorRedrive && input.reason === "issue_assigned";
+  if (!retry && !input.queuedCommentInterruptId && !commentBoundWake && !reassignmentRedrive) return null;
   const [task] = await db.select().from(issues).where(and(
     eq(issues.companyId, companyId), eq(issues.id, issueId),
   ));
@@ -118,22 +136,30 @@ export async function admitExplicitNativeContinuation(input: {
     const undelivered = await undeliveredLegacyUserCommentIds(db, companyId, issueId, agentId, ids);
     if (undelivered.length !== ids.length) return null;
   }
-  const [comment] = retry || response ? [] : await db.select().from(issueComments).where(and(
+  const [comment] = retry || response || (reassignmentRedrive && !commentId) ? [] : await db.select().from(issueComments).where(and(
     eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId),
-    eq(issueComments.id, commentId!), eq(issueComments.authorType, "user"),
-    queuedInterrupt ? undefined : eq(issueComments.authorUserId, actorId), isNull(issueComments.createdByRunId),
+    eq(issueComments.id, commentId!),
+    operatorRedrive ? eq(issueComments.authorType, "agent") : eq(issueComments.authorType, "user"),
+    operatorRedrive ? eq(issueComments.authorAgentId, actorId!) : (queuedInterrupt ? undefined : eq(issueComments.authorUserId, actorId)),
+    operatorRedrive ? undefined : isNull(issueComments.createdByRunId),
     isNull(issueComments.deletedAt),
   ));
-  if (!retry && !response && !comment?.body.trim()) return null;
+  if (!retry && !response && !(reassignmentRedrive && !commentId) && !comment?.body.trim()) return null;
   const authorizedAt = response?.comment.createdAt ?? comment?.createdAt ?? new Date();
   const [agent] = await db.select().from(agents).where(and(eq(agents.companyId, companyId), eq(agents.id, agentId)));
-  if (!agent || (!isConversationAdapter(agent.adapterType) && agent.adapterType !== "paperclip_runner")) return null;
+  if (!agent) return null;
   if (queuedInterrupt && !isConversationAdapter(agent.adapterType) && !response?.source.requiresFreshSession) return null;
   const actions = await db.select().from(issueRecoveryActions).where(and(
     eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId),
     executionBlockerPredicate(),
   )).for("update");
   if (!actions.length) return null;
+  // A settled-only hold (recovery concluded with replay refused) blocks
+  // automatic dispatch forever, so an explicitly authorized fresh turn is the
+  // only way forward. Active holds keep the previous behavior: conversation
+  // adapters with full stop proofs only.
+  const settledOnly = !actions.some((action: { status: string }) => action.status === "active" || action.status === "escalated");
+  if (!isConversationAdapter(agent.adapterType) && agent.adapterType !== "paperclip_runner" && !settledOnly) return null;
   const blocker = await getExecutionBlocker(db, companyId, issueId);
   if (blocker && blocker.recoveryActionId === null) return null;
   const [pendingInteraction] = await db.select({ id: issueThreadInteractions.id }).from(issueThreadInteractions).where(and(
@@ -199,7 +225,10 @@ export async function admitExplicitNativeContinuation(input: {
     }
     const cancelledStartup = await isCancelledNativeStartup(db, run, coordinator);
     if (cancelledStartup) cancelledStartupIds.add(run.id);
-    if (run.runtimeMode !== "native" && !unusedAdmission && !legacyUserTurn && !cancelledStartup) return null;
+    // Settled-only holds admit explicitly authorized fresh turns on any adapter:
+    // the prior run is terminal and finished (verified above), and the operator
+    // accepts the residual uncertainty. Active holds keep the native-only rule.
+    if (run.runtimeMode !== "native" && !unusedAdmission && !legacyUserTurn && !cancelledStartup && !settledOnly) return null;
     // A provider failure can finish the normal result/assessment commit path.
     // Its accepted failed result is immutable history, not a live controller.
     // Only a new user turn may pass this gate; the process/lease stop proofs
@@ -231,13 +260,16 @@ export async function admitExplicitNativeContinuation(input: {
       }))) return null;
     } else {
       if (leases.some(lease => !lease.releasedAt || lease.cleanupStatus === "failed")) return blocked("local_cleanup", "Waiting for the previous environment to finish cleanup. Your message will start automatically.");
-      if (!unusedAdmission && !cancelledStartup) {
+      // A live local process always blocks, whatever authorized the turn.
+      if (run.processPid && !processStopped(run.processPid)) return blocked("process_running", "Waiting for the previous process to stop. Your message will start automatically.");
+      if (run.processGroupId && !processStopped(-run.processGroupId)) return blocked("process_running", "Waiting for the previous process to stop. Your message will start automatically.");
+      if (!unusedAdmission && !cancelledStartup && !(settledOnly && run.runtimeMode !== "native")) {
         // A missing process identity is not evidence that a provider exited.
+        // Settled-only holds on non-native runs waive this proof: the run is
+        // terminal and finished, and the operator explicitly accepted the rest.
         if (!run.processPid && !run.processGroupId &&
             !await hasNativeLocalProcessStop(db, companyId, run.id) &&
             !await hasHistoricalSuspendedNativeSession(db, run)) return blocked("process_identity_missing", "The previous run has no verified stop record. Paperclip cannot start this message yet.");
-        if (run.processPid && !processStopped(run.processPid)) return blocked("process_running", "Waiting for the previous process to stop. Your message will start automatically.");
-        if (run.processGroupId && !processStopped(-run.processGroupId)) return blocked("process_running", "Waiting for the previous process to stop. Your message will start automatically.");
       }
     }
     if (!remote && run.runtimeMode === "native" && run.errorCode === "native_session_cleanup_quarantined") {
@@ -306,9 +338,9 @@ export async function admitExplicitNativeContinuation(input: {
       },
     }).where(eq(issueRecoveryActions.id, action.id));
   }
-  await persistActivity(db, { companyId, actorType: "user", actorId,
+  await persistActivity(db, { companyId, actorType: input.actorType === "agent" ? "agent" : "user", actorId,
     action: "issue.execution_recovery_settled", entityType: "issue", entityId: issueId,
-    details: { continuation: retry ? "explicit_user_retry" : "explicit_user_message", ...authorization,
+    details: { continuation: retry ? "explicit_user_retry" : operatorRedrive ? "explicit_operator_redrive" : "explicit_user_message", ...authorization,
       recoveryActionIds: actions.map(action => action.id), previousRunIds: sources.map(run => run.id) },
   });
   return { previousRunId: previous.id, commentId, ...(retry ? { failedRunId: input.failedRunId! } : {}) };

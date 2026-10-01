@@ -9308,11 +9308,11 @@ const RUNNERD_BINARY_CONTRACT_VERSION = 2;
 const REMOTE_PROVIDER_PACK_SCHEMA = "paperclip-runner/remote-provider-pack/v1";
 const REMOTE_PROVIDER_PACK_PINS = {
   nodeMinimum: "24.11.0",
-  codex: "0.156.0",
+  codex: "0.156.1",
   opencode: "1.18.32",
   acpx: "0.13.1",
   claudeAcp: "0.73.0",
-  codexAcp: "1.6.2",
+  codexAcp: "1.13.1",
   grok: "1.0.13",
 } as const;
 const REMOTE_PROVIDER_PACK_PROFILE_DIGESTS = {
@@ -9320,7 +9320,7 @@ const REMOTE_PROVIDER_PACK_PROFILE_DIGESTS = {
   claude:
     "sha256:9d73d1f0f121fb96cc8badb28c22d5bff02d8582eb2e40360a81c189e1b9422a",
   codex:
-    "sha256:c4538599d1ab767db5dff50934f13bb5ba313a59d9c4a83e993fac4617ea63d3",
+    "sha256:1592222a87fe2d4cf36fa6b05cc6aa2d8f3ce47ab7c498b7a46649905573357c",
 } as const;
 const REMOTE_PROVIDER_PACK_ARTIFACT_PATHS = {
   grokLauncher: "dist/providers/grok/launcher.cjs",
