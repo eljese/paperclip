@@ -7289,6 +7289,16 @@ it("preserves prepared input through runnerd and the real OpenCode proxy boundar
     process.stdout.write(proxy.verifiedResult.outputFiles[0].contents);
   `], { maxBuffer: 16 * 1024 * 1024 });
   await writeFile(proxy, proxyBytes, { mode: 0o755 });
+  // The runner verifies every launch artifact for group/world-writability,
+  // but the host Node binary's mode is environment-owned (CI toolchains have
+  // shipped group-writable modes). Stage a test-owned copy with a pinned
+  // mode like the other artifacts instead of mutating the shared toolchain.
+  // The filename must stay `node`: the runner recognizes the interpreter by
+  // basename and only then loads the proxy through its CommonJS descriptor.
+  const providerNodeCommand = join(root, "node");
+  await cp(process.execPath, providerNodeCommand);
+  await chmod(providerNodeCommand, 0o755);
+  expect((await stat(providerNodeCommand)).mode & 0o777).toBe(0o755);
   const digest = (file: string) => `sha256:${createHash("sha256").update(readFileSync(file)).digest("hex")}`;
   const runtime = join(root, "opencode");
   const bundle = createCapabilityRunnerdCodexTransport({
@@ -7300,8 +7310,8 @@ it("preserves prepared input through runnerd and the real OpenCode proxy boundar
     opencodeCommandSha256: digest(executable),
     opencodeProxyPath: proxy,
     opencodeProxySha256: digest(proxy),
-    providerNodeCommand: process.execPath,
-    providerNodeCommandSha256: digest(process.execPath),
+    providerNodeCommand,
+    providerNodeCommandSha256: digest(providerNodeCommand),
     environment: { PATH: process.env.PATH, OPENROUTER_API_KEY: "fixture-key" },
   });
   const task = createCodexTaskEnvelope({
