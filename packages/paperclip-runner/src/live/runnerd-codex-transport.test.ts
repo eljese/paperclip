@@ -7478,8 +7478,11 @@ it("preserves prepared input through runnerd and the real OpenCode proxy boundar
   execFileSync("cc", ["-x", "c", "-o", executable, "-"], {
     input: `#include <unistd.h>\n#include <stdlib.h>\nint main(int argc, char **argv) { char **args = calloc(argc + 2, sizeof(char *)); args[0] = ${JSON.stringify(process.execPath)}; args[1] = ${JSON.stringify(fixture)}; for (int i = 1; i < argc; i++) args[i + 1] = argv[i]; execv(args[0], args); return 127; }`,
   });
-  // CI may use umask 0002; qualified executables cannot be group-writable.
+  // `cc` honors the process umask, so on umask-002 hosts (including Ubuntu
+  // CI runners) the wrapper would stay group-writable and fail qualified-
+  // launch verification. Pin the mode like a real installed provider binary.
   await chmod(executable, 0o755);
+  expect((await stat(executable)).mode & 0o777).toBe(0o755);
   // Use the production bundler without depending on (or mutating) shared dist
   // artifacts. The Vitest CI lane builds Rust but does not build TypeScript.
   const proxy = join(root, "opencode-app-server-proxy.cjs");
@@ -7490,6 +7493,16 @@ it("preserves prepared input through runnerd and the real OpenCode proxy boundar
     process.stdout.write(proxy.verifiedResult.outputFiles[0].contents);
   `], { maxBuffer: 16 * 1024 * 1024 });
   await writeFile(proxy, proxyBytes, { mode: 0o755 });
+  // The runner verifies every launch artifact for group/world-writability,
+  // but the host Node binary's mode is environment-owned (CI toolchains have
+  // shipped group-writable modes). Stage a test-owned copy with a pinned
+  // mode like the other artifacts instead of mutating the shared toolchain.
+  // The filename must stay `node`: the runner recognizes the interpreter by
+  // basename and only then loads the proxy through its CommonJS descriptor.
+  const providerNodeCommand = join(root, "node");
+  await cp(process.execPath, providerNodeCommand);
+  await chmod(providerNodeCommand, 0o755);
+  expect((await stat(providerNodeCommand)).mode & 0o777).toBe(0o755);
   const digest = (file: string) => `sha256:${createHash("sha256").update(readFileSync(file)).digest("hex")}`;
   const runtime = join(root, "opencode");
   const bundle = createCapabilityRunnerdCodexTransport({
@@ -7501,8 +7514,8 @@ it("preserves prepared input through runnerd and the real OpenCode proxy boundar
     opencodeCommandSha256: digest(executable),
     opencodeProxyPath: proxy,
     opencodeProxySha256: digest(proxy),
-    providerNodeCommand: process.execPath,
-    providerNodeCommandSha256: digest(process.execPath),
+    providerNodeCommand,
+    providerNodeCommandSha256: digest(providerNodeCommand),
     environment: { PATH: process.env.PATH, OPENROUTER_API_KEY: "fixture-key" },
   });
   const task = createCodexTaskEnvelope({
@@ -7523,21 +7536,24 @@ it("preserves prepared input through runnerd and the real OpenCode proxy boundar
     task: { prompt: "Keep this request unchanged." },
     completionContract: { revision: "prepared-v1", criteria: task.completionContract.criteria },
   });
-  await withPreparedOpenCodeCleanup({
-    run: async () => {
-      session = await driver.openSession({ runId: "prepared-opencode", normalizedSessionId: "prepared-opencode", workingDirectory: root });
-      await session.startTurn({ message: { role: "user", text: prepared } });
-      for await (const event of session.events()) {
-        if (event.eventType === "turn.completed") break;
-      }
-      const sessionRoots = (await readdir(runtime, { withFileTypes: true })).filter((entry) => entry.isDirectory());
-      expect(sessionRoots).toHaveLength(1);
-      const requests = (await readFile(join(runtime, sessionRoots[0]!.name, "data/fake-prompt-requests.ndjson"), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
-      expect(requests.map((request) => request.parts)).toEqual([[{ type: "text", text: prepared }]]);
-    },
-    closeSession: async () => { await session?.close(); },
-    closeTransport: () => bundle.transport.close(),
-    removeRoot: () => rm(root, { recursive: true, force: true }),
-    evidence: () => bundle.evidence(),
-  });
+  try {
+    session = await driver.openSession({ runId: "prepared-opencode", normalizedSessionId: "prepared-opencode", workingDirectory: root });
+    await session.startTurn({ message: { role: "user", text: prepared } });
+    for await (const event of session.events()) {
+      if (event.eventType === "turn.completed") break;
+    }
+    const sessionRoots = (await readdir(runtime, { withFileTypes: true })).filter((entry) => entry.isDirectory());
+    expect(sessionRoots).toHaveLength(1);
+    const requests = (await readFile(join(runtime, sessionRoots[0]!.name, "data/fake-prompt-requests.ndjson"), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    expect(requests.map((request) => request.parts)).toEqual([[{ type: "text", text: prepared }]]);
+  } finally {
+    await session?.close();
+    // The transport memoizes its close promise: when session open fails, a
+    // bare re-close rethrows the fail-closed suspension error and masks the
+    // original open failure. Preserve the authoritative error in each case.
+    await bundle.transport.close().catch((closeError: unknown) => {
+      if (session !== undefined) throw closeError;
+    });
+    await rm(root, { recursive: true, force: true });
+  }
 }, 30_000);
