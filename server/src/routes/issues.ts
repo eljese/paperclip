@@ -14681,6 +14681,11 @@ export function issueRoutes(
                   }
                 : {}),
               source: "issue.update",
+              // An operator reassignment is explicit re-drive authorization for
+              // the new assignee past a SETTLED execution hold (never active).
+              ...(assigneeChanged && !isClosedIssueStatus(issue.status)
+                ? { explicitOperatorRedrive: true }
+                : {}),
               ...(resumeRequested === true
                 ? { resumeIntent: true, followUpRequested: true }
                 : {}),
@@ -18180,6 +18185,12 @@ export function issueRoutes(
                 wakeCommentId: comment.id,
                 source: "issue.comment.reopen",
                 wakeReason: "issue_reopened_via_comment",
+                // Route-attested explicit re-drive: lets this wake admit a fresh
+                // turn past a SETTLED execution hold (never past an active one).
+                ...(actorIsAgent && !selfComment &&
+                (resumeRequested === true || effectiveReopenRequested === true)
+                  ? { explicitOperatorRedrive: true }
+                  : {}),
                 reopenedFrom: reopenFromStatus,
                 ...(resumeRequested === true
                   ? { resumeIntent: true, followUpRequested: true }
@@ -18217,6 +18228,12 @@ export function issueRoutes(
                 wakeCommentId: comment.id,
                 source: "issue.comment",
                 wakeReason: "issue_commented",
+                // Route-attested explicit re-drive: lets this wake admit a fresh
+                // turn past a SETTLED execution hold (never past an active one).
+                ...(actorIsAgent && !selfComment &&
+                (resumeRequested === true || effectiveReopenRequested === true)
+                  ? { explicitOperatorRedrive: true }
+                  : {}),
                 ...(resumeRequested === true
                   ? { resumeIntent: true, followUpRequested: true }
                   : {}),

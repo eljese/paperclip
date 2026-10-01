@@ -14,6 +14,24 @@ export function executionBlockerPredicate() {
   );
 }
 
+/**
+ * True when the issue carries at least one execution-reconciliation hold that
+ * is still actively being worked (status active/escalated). A hold whose
+ * recovery already settled (resolved/cancelled) but keeps replay='blocked'
+ * evidence remains an effective no-replay hold via executionBlockerPredicate,
+ * yet nothing is still in flight: no automatic path will ever clear it, so an
+ * explicitly authorized fresh turn (never a replay) is the only way forward.
+ */
+export async function hasActiveExecutionHold(db: Db, companyId: string, issueId: string): Promise<boolean> {
+  const [active] = await db.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
+    eq(issueRecoveryActions.companyId, companyId),
+    eq(issueRecoveryActions.sourceIssueId, issueId),
+    executionBlockerPredicate(),
+    inArray(issueRecoveryActions.status, ["active", "escalated"]),
+  )).limit(1);
+  return Boolean(active);
+}
+
 export async function getExecutionBlocker(db: Db, companyId: string, issueId: string, options?: { conversationResetCommentId?: string | null }): Promise<ExecutionBlocker | null> {
   const [conversation] = await db.select({ agentId: issues.conversationAgentId,
     boundaryId: issues.conversationBoundaryCommentId }).from(issues).where(and(

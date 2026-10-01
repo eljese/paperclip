@@ -26,7 +26,7 @@ import { admitExplicitNativeContinuation, undeliveredLegacyUserCommentIds } from
 import { connectionIntentService } from "./connection-intents.js";
 import { managedAiSessionFingerprintConfig, prepareManagedAiRuntime, assertManagedAiProjectAuth, stripAiAuthBindings, isAiConnectionBusy, AI_AUTH_ENV_KEYS } from "./ai-connection-runtime.js";
 import { aiConnectionBindingSchema } from "@paperclipai/shared";
-import { executionBlockerPredicate, getExecutionBlocker } from "./execution-blocker.js";
+import { executionBlockerPredicate, getExecutionBlocker, hasActiveExecutionHold } from "./execution-blocker.js";
 import { CONVERSATION_CONTINUATION_POLICY, claimedAdapterType, runUsedConversationAdapter, hasConversationContinuationPolicy, isConversationAdapter } from "./conversation-continuation.js";
 import { recordExecutionWait } from "./execution-wait.js";
 import { getNativeReviewAssignment, readNativeReviewAssignmentContext } from "./native-runtime/native-review-participant.js";
@@ -27268,6 +27268,28 @@ export function heartbeatService(
               }).where(eq(agentWakeupRequests.id, executionWaitRequestId));
               return { kind: "deferred" as const };
             }
+            // Loud deferral: a deferred wake must be operator-visible. The
+            // JES-189 stall stayed silent across five wakes because nothing
+            // recorded the hold outside the wakeup-request row.
+            await logActivity(tx as unknown as Db, {
+              companyId: agent.companyId,
+              actorType: "system",
+              actorId: "wake-dispatch",
+              agentId,
+              action: "issue.wake_deferred_execution_hold",
+              entityType: "issue",
+              entityId: issue.id,
+              details: {
+                identifier: issue.identifier ?? null,
+                recoveryActionId: executionBlocker.recoveryActionId,
+                cause: executionBlocker.cause,
+                nextAction: executionBlocker.nextAction,
+                wakeReason: reason,
+                settledOnly: executionBlocker.recoveryActionId
+                  ? !(await hasActiveExecutionHold(tx as unknown as Db, agent.companyId, issue.id))
+                  : null,
+              },
+            });
             if (durableRequest || wakeCommentId ||
                 hasInteractionContinuationWakeContext(enrichedContextSnapshot) ||
                 readNonEmptyString(enrichedContextSnapshot.nativeStatusWakeIntentId)) {
@@ -27322,6 +27344,7 @@ export function heartbeatService(
             commentId: wakeCommentId ?? null, failedRunId: opts.failedRunId, successorRunId: explicitContinuationRunId,
             queuedCommentInterruptId: opts.queuedCommentInterruptId,
             queuedCommentRequestId: opts.queuedCommentRequestId,
+            explicitOperatorRedrive: enrichedContextSnapshot.explicitOperatorRedrive === true,
             dryRun: true,
             onBlocked: (reason, message) => { continuationWait = { reason, message }; },
           }))) return deferBlockedExecution(executionBlocker);
@@ -28088,6 +28111,7 @@ export function heartbeatService(
             commentId: wakeCommentId ?? null, failedRunId: opts.failedRunId, successorRunId: explicitContinuationRunId,
             queuedCommentInterruptId: opts.queuedCommentInterruptId,
             queuedCommentRequestId: opts.queuedCommentRequestId,
+            explicitOperatorRedrive: enrichedContextSnapshot.explicitOperatorRedrive === true,
           });
           if (!explicitContinuation && executionBlocker) return deferBlockedExecution(executionBlocker);
           if (explicitContinuation) {
