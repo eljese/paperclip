@@ -10867,8 +10867,8 @@ describe("runnerd provider runtime wiring", () => {
 
   it.each([
     ...["current", "preinstalled-exact", "preinstalled-mismatch", "preinstalled-error", "preinstalled-timeout", "stale", "missing", "retained", "retained-mismatch", "retained-error", "retained-timeout", "retained-explicit"]
-      .map((image) => ({ image, version: "0.156.0", compatible: true })),
-    ...["0.149.0", "0.149.1", "0.153.4", "0.156.1"]
+      .map((image) => ({ image, version: "0.156.1", compatible: true })),
+    ...["0.149.0", "0.149.1", "0.153.4", "0.156.0"]
       .map((version) => ({ image: "current", version, compatible: true })),
     ...["0.148.9", "0.157.0", "1.0.0", "0.156.0-alpha.1", "unknown"]
       .map((version) => ({ image: "current", version, compatible: false })),
@@ -10972,7 +10972,7 @@ describe("runnerd provider runtime wiring", () => {
       expect(onLog).not.toHaveBeenCalledWith("stderr", expect.stringContaining("using compatible Codex"));
       return;
     }
-    if (version !== "0.156.0") {
+    if (version !== "0.156.1") {
       expect(onLog).toHaveBeenCalledWith("stderr", expect.stringContaining(`using compatible Codex ${version}`));
     }
     if (needsReplacement) {
