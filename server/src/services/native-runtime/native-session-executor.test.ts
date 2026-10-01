@@ -1075,11 +1075,11 @@ describe("remote provider pack manifest", () => {
     const payload = {
       pins: {
         nodeMinimum: "24.11.0",
-        codex: "0.156.0",
+        codex: "0.156.1",
         opencode: "1.18.32",
         acpx: "0.13.1",
         claudeAcp: "0.73.0",
-        codexAcp: "1.6.2",
+        codexAcp: "1.13.1",
         grok: "1.0.13",
       },
       target: { platform: "linux", architecture: "x64" },
@@ -1091,7 +1091,7 @@ describe("remote provider pack manifest", () => {
         claude:
           "sha256:9d73d1f0f121fb96cc8badb28c22d5bff02d8582eb2e40360a81c189e1b9422a",
         codex:
-          "sha256:c4538599d1ab767db5dff50934f13bb5ba313a59d9c4a83e993fac4617ea63d3",
+          "sha256:1592222a87fe2d4cf36fa6b05cc6aa2d8f3ce47ab7c498b7a46649905573357c",
       },
       artifacts: {
         grokLauncher: { path: "dist/providers/grok/launcher.cjs", sha256: digest(grokLauncher) },
@@ -10867,8 +10867,8 @@ describe("runnerd provider runtime wiring", () => {
 
   it.each([
     ...["current", "preinstalled-exact", "preinstalled-mismatch", "preinstalled-error", "preinstalled-timeout", "stale", "missing", "retained", "retained-mismatch", "retained-error", "retained-timeout", "retained-explicit"]
-      .map((image) => ({ image, version: "0.156.0", compatible: true })),
-    ...["0.149.0", "0.149.1", "0.153.4", "0.156.1"]
+      .map((image) => ({ image, version: "0.156.1", compatible: true })),
+    ...["0.149.0", "0.149.1", "0.153.4", "0.156.0"]
       .map((version) => ({ image: "current", version, compatible: true })),
     ...["0.148.9", "0.157.0", "1.0.0", "0.156.0-alpha.1", "unknown"]
       .map((version) => ({ image: "current", version, compatible: false })),
@@ -10972,7 +10972,7 @@ describe("runnerd provider runtime wiring", () => {
       expect(onLog).not.toHaveBeenCalledWith("stderr", expect.stringContaining("using compatible Codex"));
       return;
     }
-    if (version !== "0.156.0") {
+    if (version !== "0.156.1") {
       expect(onLog).toHaveBeenCalledWith("stderr", expect.stringContaining(`using compatible Codex ${version}`));
     }
     if (needsReplacement) {
@@ -11128,7 +11128,7 @@ describe("runnerd provider runtime wiring", () => {
           agent: "codex",
           agentProfileVersion: 1,
           agentServerPackage: "@agentclientprotocol/codex-acp",
-          agentServerVersion: "1.6.2",
+          agentServerVersion: "1.13.1",
           agentRuntimePackage: null,
           agentRuntimeVersion: null,
           commandDigest: "sha256:test",
