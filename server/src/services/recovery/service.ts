@@ -4,6 +4,11 @@ import { settleSlackConversation } from "../slack-conversation-lifecycle.js";
 import { externalConversationStateSql } from "../slack-conversation-state.js";
 import { executionRetryAccounting } from "../execution-recovery-attempt.js";
 import {
+  HOST_OOM_ERROR_CODE,
+  attributeHostOomErrorCode,
+  isHostOomActive,
+} from "../host-oom.js";
+import {
   decideLegacyContinuation, legacyDispositionEpisode, legacyDispositionFingerprint,
   LEGACY_DISPOSITION_REPAIR_INSTRUCTION, type LegacyDispositionEpisode,
 } from "./legacy-continuation.js";
@@ -5925,9 +5930,20 @@ export function recoveryService(
 
     const authority = issueTerminalStatus ? "issue_terminal" : "process_gone";
     const terminalStatus = issueTerminalStatus ?? "interrupted";
-    const errorCode = issueTerminalStatus
+    const baseErrorCode = issueTerminalStatus
       ? "orphaned_running_run_issue_terminal"
       : "orphaned_running_run";
+    // OOM-aware settlement (JES-342): attribute host-OOM deaths with a
+    // distinct code. Best-effort, never blocks terminalization.
+    let errorCode = baseErrorCode;
+    try {
+      if (!issueTerminalStatus && isHostOomActive().active) {
+        errorCode = attributeHostOomErrorCode(baseErrorCode, true);
+      }
+    } catch {
+      errorCode = baseErrorCode;
+    }
+    const hostOomAttributed = errorCode === HOST_OOM_ERROR_CODE;
     const message =
       authority === "issue_terminal"
         ? "run terminalized by recovery backstop: issue reached a terminal status while heartbeat_runs.status stayed live"
@@ -6030,6 +6046,7 @@ export function recoveryService(
           ...(issueId ? { issueId } : {}),
           pid,
           processGroupId,
+          ...(hostOomAttributed ? { hostOomAttributed: true, errorCode } : {}),
         },
       });
     } catch (error) {

@@ -50,6 +50,16 @@ import {
   waitForAdapterStop,
 } from "./adapter-execution-control.js";
 import { executionFailureRetryCount, executionRetryAttemptCount, accountingForScheduledRetry } from "./execution-recovery-attempt.js";
+import {
+  HOST_OOM_ERROR_CODE,
+  HOST_OOM_MAX_ATTEMPTS,
+  HOST_OOM_RETRY_REASON,
+  HOST_OOM_RETRY_WAKE_REASON,
+  attributeHostOomErrorCode,
+  computeHostOomRetrySchedule,
+  isHostOomActive,
+  isHostOomRetryEnabled,
+} from "./host-oom.js";
 import { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
 export { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
 import { buildExecutionContinuation, StaleExecutionContinuationError } from "./execution-continuation.js";
@@ -9420,7 +9430,11 @@ export function resolveHeartbeatSchedulingSuppression(
 ): {
   suppressed: boolean;
   reason:
-    "worktree_instance" | "database_restore_in_progress" | "task_drain" | null;
+    | "worktree_instance"
+    | "database_restore_in_progress"
+    | "task_drain"
+    | "host_oom_pressure"
+    | null;
 } {
   if (
     isTruthyRuntimeEnvValue(env.PAPERCLIP_IN_WORKTREE) &&
@@ -9436,6 +9450,17 @@ export function resolveHeartbeatSchedulingSuppression(
   }
   if (readTaskDrain(new Date()) !== null) {
     return { suppressed: true, reason: "task_drain" };
+  }
+  // Host-OOM dispatch guard (JES-342): pause new dispatch while host memory
+  // pressure is active. Env-only here so the pure check stays side-effect
+  // free; the async scheduler tick below adds marker/cgroup signals. No-op
+  // when no OOM (override unset, marker absent, cgroup unreadable).
+  try {
+    if (isHostOomActive({ env }).active) {
+      return { suppressed: true, reason: "host_oom_pressure" };
+    }
+  } catch {
+    // Detection never blocks scheduling.
   }
   return { suppressed: false, reason: null };
 }
@@ -9499,9 +9524,21 @@ export function heartbeatService(
   };
   const getSchedulingSuppression = async () => {
     const override = await resolveWorktreeRunExecutionOverride();
-    return resolveHeartbeatSchedulingSuppression(runtimeEnv, {
+    const base = resolveHeartbeatSchedulingSuppression(runtimeEnv, {
       allowWorktreeRunExecution: override.allowed,
     });
+    if (base.suppressed) return base;
+    // File/cgroup OOM signals (marker file, cgroup memory.events) pause new
+    // dispatch within the existing scheduler tick; no new loops. Never throws
+    // and never blocks settlement when signals are unavailable.
+    try {
+      if (isHostOomActive({ env: runtimeEnv }).active) {
+        return { suppressed: true as const, reason: "host_oom_pressure" as const };
+      }
+    } catch {
+      // Detection optional, never blocking.
+    }
+    return base;
   };
   const getWorktreeExecutionCutoff = async () => {
     const override = await resolveWorktreeRunExecutionOverride();
@@ -15284,14 +15321,31 @@ export function heartbeatService(
         errorCode: "chat_completion_outbox_owns_retry" as const, issueId: readNonEmptyString(run.contextSnapshot.issueId) };
     }
     const now = opts?.now ?? new Date();
-    const retryReason =
-      opts?.retryReason ?? BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON;
-    const wakeReason =
-      opts?.wakeReason ?? BOUNDED_TRANSIENT_HEARTBEAT_RETRY_WAKE_REASON;
+    // Cause-aware retry (JES-342): OOM-attributed deaths use a separate
+    // infra-retry lane (2m -> 8m -> 30m, 3 attempts) that does not consume
+    // the bounded failure budget. Feature-flagged; when disabled, OOM runs
+    // fall back to the legacy bounded schedule. Explicit caller lanes
+    // (max-turn, interaction infra, workspace/ai waits) are never overridden.
+    const isOomAttributedRun = run.errorCode === HOST_OOM_ERROR_CODE;
+    const callerUsesDefaultLane =
+      opts?.retryReason === undefined ||
+      opts?.retryReason === BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON;
+    const useHostOomLane =
+      isOomAttributedRun &&
+      callerUsesDefaultLane &&
+      opts?.delayMs == null &&
+      opts?.maxAttempts == null &&
+      isHostOomRetryEnabled(runtimeEnv);
+    const retryReason = useHostOomLane
+      ? HOST_OOM_RETRY_REASON
+      : (opts?.retryReason ?? BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON);
+    const wakeReason = useHostOomLane
+      ? HOST_OOM_RETRY_WAKE_REASON
+      : (opts?.wakeReason ?? BOUNDED_TRANSIENT_HEARTBEAT_RETRY_WAKE_REASON);
     const maxAttempts = Math.max(
       0,
       Math.floor(
-        opts?.maxAttempts ?? BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS,
+        opts?.maxAttempts ?? (useHostOomLane ? HOST_OOM_MAX_ATTEMPTS : BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS),
       ),
     );
     const consumedAttempts = executionRetryAttemptCount(run, retryReason);
@@ -15310,11 +15364,13 @@ export function heartbeatService(
             }
           : null
         : nextAttempt <= maxAttempts
-          ? computeBoundedTransientHeartbeatRetrySchedule(
-              nextAttempt,
-              now,
-              opts?.random,
-            )
+          ? useHostOomLane
+            ? computeHostOomRetrySchedule(nextAttempt, now)
+            : computeBoundedTransientHeartbeatRetrySchedule(
+                nextAttempt,
+                now,
+                opts?.random,
+              )
           : null;
     const baseSchedule = computedBaseSchedule
       ? { ...computedBaseSchedule, maxAttempts }
@@ -15494,6 +15550,9 @@ export function heartbeatService(
           : {}),
         ...(retryReason === AI_CONNECTION_BUSY_RETRY_REASON
           ? { failureRetriesBeforeAiConnectionWait: executionFailureRetryCount(run) }
+          : {}),
+        ...(retryReason === HOST_OOM_RETRY_REASON
+          ? { failureRetriesBeforeHostOomWait: executionFailureRetryCount(run) }
           : {}),
         ...(shouldQuarantineWorkspaceForRetry
           ? {
@@ -19311,6 +19370,23 @@ export function heartbeatService(
       if (!(await revokeExpiredLegacyController(db, run))) continue;
       const baseMessage = buildProcessLossMessage(run);
       const conversationContinuationEligible = await runUsedConversationAdapter(db, run);
+      // OOM-aware settlement (JES-342): when host-OOM pressure is active,
+      // record host_oom_kill instead of generic process_lost. Detection is
+      // best-effort and never blocks settlement.
+      let processLossErrorCode = "process_lost";
+      let processLossHostOom = false;
+      try {
+        if (isHostOomActive({ env: runtimeEnv }).active) {
+          const attributed = attributeHostOomErrorCode("process_lost", true);
+          if (attributed === HOST_OOM_ERROR_CODE) {
+            processLossErrorCode = attributed;
+            processLossHostOom = true;
+          }
+        }
+      } catch {
+        processLossErrorCode = "process_lost";
+        processLossHostOom = false;
+      }
 
       const failureWrite = await setRunStatusFromLive(
         run.id,
@@ -19318,7 +19394,7 @@ export function heartbeatService(
         ["running"],
         {
           error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
-          errorCode: "process_lost",
+          errorCode: processLossErrorCode,
           finishedAt: now,
           resultJson: (() => {
             const result = mergeRunStopMetadataForAgent(
@@ -19327,7 +19403,7 @@ export function heartbeatService(
               {
                 conversationContinuationEligible,
                 resultJson: parseObject(run.resultJson),
-                errorCode: "process_lost",
+                errorCode: processLossErrorCode,
                 errorMessage: shouldRetry
                   ? `${baseMessage}; retrying once`
                   : baseMessage,
@@ -19393,6 +19469,7 @@ export function heartbeatService(
           ...(run.processPid ? { processPid: run.processPid } : {}),
           ...(run.processGroupId ? { processGroupId: run.processGroupId } : {}),
           ...(retriedRun ? { retryRunId: retriedRun.id } : {}),
+          ...(processLossHostOom ? { hostOomAttributed: true, errorCode: processLossErrorCode } : {}),
         },
       });
 
@@ -25065,7 +25142,7 @@ export function heartbeatService(
                 );
         const recordedResponsibleUserDenialCode =
           normalizeResponsibleUserDenialCode(latestRun?.errorCode);
-        const runErrorCode =
+        const baseRunErrorCode =
           outcome === "timed_out"
             ? "timeout"
             : outcome === "cancelled"
@@ -25075,6 +25152,25 @@ export function heartbeatService(
                   recordedResponsibleUserDenialCode ??
                   "adapter_failed")
                 : null;
+        // OOM-aware settlement (JES-342): attribute generic adapter deaths to
+        // host_oom_kill while host-OOM pressure is active. Non-OOM failures
+        // keep the exact original code.
+        const runErrorCode =
+          baseRunErrorCode !== null
+            ? (() => {
+                try {
+                  if (outcome === "failed" && isHostOomActive({ env: runtimeEnv }).active) {
+                    return attributeHostOomErrorCode(baseRunErrorCode, true, {
+                      exitCode: adapterResult.exitCode ?? null,
+                      signal: adapterResult.signal ?? null,
+                    });
+                  }
+                } catch {
+                  // Detection never blocks settlement.
+                }
+                return baseRunErrorCode;
+              })()
+            : null;
 
         let logSummary: {
           bytes: number | null;
@@ -25787,13 +25883,24 @@ export function heartbeatService(
               : null;
           })
           .catch(() => null);
-        const failureErrorCode =
+        const baseFailureErrorCode =
           workspaceValidationFailure?.code ??
           configurationIncompleteFailure?.code ??
           nonRetryablePreflightFailureCode(err) ??
           recordedResponsibleUserDenialCode ??
           nativeTerminalFailureCode ??
           "adapter_failed";
+        // OOM-aware settlement (JES-342): see adapter-result path above.
+        const failureErrorCode = (() => {
+          try {
+            if (isHostOomActive({ env: runtimeEnv }).active) {
+              return attributeHostOomErrorCode(baseFailureErrorCode, true);
+            }
+          } catch {
+            // Detection never blocks settlement.
+          }
+          return baseFailureErrorCode;
+        })();
         logger.error({ err, runId }, "heartbeat execution failed");
 
         let logSummary: {
