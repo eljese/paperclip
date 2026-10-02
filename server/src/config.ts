@@ -93,6 +93,8 @@ export interface Config {
   feedbackExportBackendToken: string | undefined;
   heartbeatSchedulerEnabled: boolean;
   heartbeatSchedulerIntervalMs: number;
+  checkoutLockSweepDeadMinutes: number;
+  checkoutLockSweepEnabled: boolean;
   companyDeletionEnabled: boolean;
   telemetryEnabled: boolean;
   announcementsEnabled: boolean;
@@ -116,6 +118,12 @@ function detectTailnetBindHost(): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+function readCheckoutLockSweepDeadMinutes(): number {
+  const raw = Number(process.env.CHECKOUT_LOCK_SWEEP_DEAD_MINUTES);
+  if (Number.isFinite(raw) && raw > 0) return Math.floor(raw);
+  return 30;
 }
 
 export function loadConfig(): Config {
@@ -364,6 +372,8 @@ export function loadConfig(): Config {
     feedbackExportBackendToken,
     heartbeatSchedulerEnabled: process.env.HEARTBEAT_SCHEDULER_ENABLED !== "false",
     heartbeatSchedulerIntervalMs: Math.max(10000, Number(process.env.HEARTBEAT_SCHEDULER_INTERVAL_MS) || 30000),
+    checkoutLockSweepDeadMinutes: readCheckoutLockSweepDeadMinutes(),
+    checkoutLockSweepEnabled: process.env.CHECKOUT_LOCK_SWEEP_ENABLED !== "false",
     companyDeletionEnabled,
     telemetryEnabled: fileConfig?.telemetry?.enabled ?? true,
     announcementsEnabled: process.env.PAPERCLIP_ANNOUNCEMENTS_ENABLED !== "false",
