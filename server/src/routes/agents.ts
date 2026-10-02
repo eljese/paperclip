@@ -18,6 +18,7 @@ import { executionProjectionForRun, executionProjectionsForRuns } from "../servi
 import { Router, type NextFunction, type Request, type Response } from "express";
 import { generateKeyPairSync, randomUUID } from "node:crypto";
 import { readFile, rm } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import type { Db } from "@paperclipai/db";
 import type { ChatChannelService } from "../services/chat-channels.js";
@@ -3881,6 +3882,46 @@ export function agentRoutes(
     },
   );
 
+  // Union of desired skill keys across all pi_local agents resolving to the
+  // same Pi skills home. pi_local agents share one home directory, so each
+  // sync must prune only keys desired by NOBODY. Agents are grouped by
+  // configured $HOME (unset HOME values share the host default home); only
+  // adapter-managed desired keys are unioned, never user/external entries.
+  async function resolvePiLocalUnionDesiredSkills(
+    companyId: string,
+    syncingAgentId: string,
+    syncingConfig: Record<string, unknown>,
+    syncingDesiredSkills: string[],
+  ): Promise<string[]> {
+    const union = new Set(syncingDesiredSkills);
+    const syncingHome = piSkillsHomeKey(syncingConfig);
+    let siblings: Array<{ id: string; adapterType: string; adapterConfig: unknown }> = [];
+    try {
+      siblings = await svc.list(companyId);
+    } catch {
+      return Array.from(union);
+    }
+    for (const sibling of siblings) {
+      if (sibling.id === syncingAgentId) continue;
+      if (sibling.adapterType !== "pi_local") continue;
+      const siblingConfig = (sibling.adapterConfig ?? {}) as Record<string, unknown>;
+      if (piSkillsHomeKey(siblingConfig) !== syncingHome) continue;
+      for (const key of readPaperclipSkillSyncPreference(siblingConfig).desiredSkills) {
+        union.add(key);
+      }
+    }
+    return Array.from(union);
+  }
+
+  function piSkillsHomeKey(config: Record<string, unknown>): string {
+    const env = parseObject((config as Record<string, unknown>).env);
+    const configuredHome = typeof env.HOME === "string" && env.HOME.trim() ? env.HOME.trim() : null;
+    // Mirror the adapter's resolvePiSkillsHome so grouping matches the real
+    // on-disk home: explicit $HOME or the host default home.
+    const home = configuredHome ? path.resolve(configuredHome) : os.homedir();
+    return path.join(home, ".pi", "agent", "skills");
+  }
+
   router.get("/agents/:id/skills", async (req, res) => {
     const id = req.params.id as string;
     const agent = await svc.getById(id);
@@ -3980,13 +4021,31 @@ export function agentRoutes(
       const connectorAssignments = await resolveConnectorAssignments(db, { companyId: updated.companyId, agentId: updated.id });
       const runtimeSkillConfig = await applyConnectorSkills(runtimeConfig, runtimeSkillEntries, connectorAssignments);
       const manualSkillConfig = await applyConnectorSkills(runtimeConfig, runtimeSkillEntries, []);
+      const manualDesiredSkills = readPaperclipSkillSyncPreference(manualSkillConfig).desiredSkills;
+      // All pi_local agents share one skills home (~/.pi/agent/skills), so a
+      // per-agent sync is last-writer-wins without the union: each sync must
+      // preserve skills desired by sibling agents resolving to the same home.
+      // Single-agent deployments pass the per-agent set (union of one).
+      let unionDesiredSkills: string[] | undefined;
+      if (updated.adapterType === "pi_local") {
+        unionDesiredSkills = await resolvePiLocalUnionDesiredSkills(
+          updated.companyId,
+          updated.id,
+          manualSkillConfig,
+          manualDesiredSkills,
+        );
+      }
       let snapshot = adapter?.syncSkills
         ? await adapter.syncSkills({
             agentId: updated.id,
             companyId: updated.companyId,
             adapterType: updated.adapterType,
             config: manualSkillConfig,
-          }, readPaperclipSkillSyncPreference(manualSkillConfig).desiredSkills)
+          }, manualDesiredSkills,
+          // Backward-compatible: the union option is only passed for pi_local
+          // (the sole shared-home adapter), so every other adapter keeps its
+          // exact two-argument call shape.
+          ...(unionDesiredSkills ? [{ unionDesiredSkills }] : []))
         : adapter?.listSkills
           ? await adapter.listSkills({
               agentId: updated.id,
