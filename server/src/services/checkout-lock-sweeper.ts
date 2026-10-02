@@ -2,7 +2,7 @@ import { and, eq, inArray, isNotNull, isNull } from "drizzle-orm";
 import { heartbeatRuns, issues, type Db } from "@paperclipai/db";
 import { runningProcesses } from "../adapters/utils.js";
 import { logActivity } from "./activity-log.js";
-import { TERMINAL_HEARTBEAT_RUN_STATUSES } from "./issues.js";
+import { TERMINAL_HEARTBEAT_RUN_STATUSES } from "./heartbeat-run-statuses.js";
 import {
   isPidAlive as defaultIsPidAlive,
   isProcessGroupAlive as defaultIsProcessGroupAlive,

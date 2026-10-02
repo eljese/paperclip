@@ -3,6 +3,7 @@ import { mirrorSlackBoardComment, slackBoardReplyBindings } from "./slack-board-
 import { assertAgentRunWriteAllowed } from "../agent-run-cancellation.js";
 import { externalConversationStateSql, nonIdleSlackIssueCondition, resumeSlackConversation } from "./slack-conversation-state.js";
 import { documentService } from "./documents.js";
+import { TERMINAL_HEARTBEAT_RUN_STATUSES } from "./heartbeat-run-statuses.js";
 import { parseTaskSearch, taskSearchCtes, taskSearchScore } from "./task-search.js";
 import { createdFromIssueCondition } from "./issue-creation-origin.js";
 import { executionProjectionsForRuns } from "./execution-projection.js";
@@ -2053,13 +2054,7 @@ function sameRunLock(checkoutRunId: string | null, actorRunId: string | null) {
   return checkoutRunId == null;
 }
 
-export const TERMINAL_HEARTBEAT_RUN_STATUSES = new Set([
-  "succeeded",
-  "interrupted",
-  "failed",
-  "cancelled",
-  "timed_out",
-]);
+export { TERMINAL_HEARTBEAT_RUN_STATUSES };
 const ISSUE_LIST_DESCRIPTION_MAX_CHARS = 1200;
 const ISSUE_LIST_DESCRIPTION_MAX_BYTES = ISSUE_LIST_DESCRIPTION_MAX_CHARS * 4;
 
