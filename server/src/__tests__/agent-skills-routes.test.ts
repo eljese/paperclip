@@ -1562,4 +1562,51 @@ describe.sequential("agent skill routes", () => {
     expect(mockAgentService.create).not.toHaveBeenCalled();
     expect(mockAgentInstructionsService.materializeManagedBundle).not.toHaveBeenCalled();
   });
+
+  it("passes the pi_local union of sibling desired skills to syncSkills", async () => {
+    const syncingId = "11111111-1111-4111-8111-111111111111";
+    const alphaKey = "paperclipai/paperclip/alpha";
+    const betaKey = "paperclipai/paperclip/beta";
+    const gammaKey = "paperclipai/paperclip/gamma";
+    mockAgentService.getById.mockResolvedValue({
+      ...makeAgent("pi_local"),
+      id: syncingId,
+      adapterConfig: {
+        paperclipSkillSync: { desiredSkills: [alphaKey] },
+      },
+    });
+    mockAgentService.update.mockImplementationOnce(async (_id: string, patch: Record<string, unknown>) => ({
+      ...makeAgent("pi_local"),
+      id: syncingId,
+      adapterConfig: patch.adapterConfig ?? {},
+    }));
+    // Siblings: one pi_local sharing the default home (unioned), one pi_local
+    // with a different $HOME (excluded), one non-pi_local agent (excluded).
+    (mockAgentService as unknown as Record<string, unknown>).list = vi.fn().mockResolvedValue([
+      { id: syncingId, adapterType: "pi_local", adapterConfig: {} },
+      { id: "22222222-2222-4222-8222-222222222222", adapterType: "pi_local", adapterConfig: { paperclipSkillSync: { desiredSkills: [betaKey] } } },
+      { id: "33333333-3333-4333-8333-333333333333", adapterType: "pi_local", adapterConfig: { env: { HOME: "/other-home" }, paperclipSkillSync: { desiredSkills: [gammaKey] } } },
+      { id: "44444444-4444-4433-8444-444444444444", adapterType: "claude_local", adapterConfig: { paperclipSkillSync: { desiredSkills: [gammaKey] } } },
+    ]);
+    mockSecretService.resolveAdapterConfigForRuntime.mockImplementationOnce(
+      async (_companyId: string, config: Record<string, unknown>) => ({ config }),
+    );
+
+    const res = await requestApp(await createApp(), (baseUrl) => request(baseUrl)
+      .post(`/api/agents/${syncingId}/skills/sync?companyId=company-1`)
+      .send({ desiredSkills: [alphaKey], mode: "replace" }));
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockAdapter.syncSkills).toHaveBeenCalledWith(
+      expect.objectContaining({ adapterType: "pi_local" }),
+      expect.arrayContaining([alphaKey]),
+      expect.objectContaining({
+        unionDesiredSkills: expect.arrayContaining([alphaKey, betaKey]),
+      }),
+    );
+    const unionOption = mockAdapter.syncSkills.mock.calls.at(-1)?.[2] as
+      | { unionDesiredSkills?: string[] }
+      | undefined;
+    expect(unionOption?.unionDesiredSkills).not.toContain(gammaKey);
+  });
 });

@@ -23,6 +23,7 @@ export type {
   AdapterSkillEntry,
   AdapterSkillSnapshot,
   AdapterSkillContext,
+  AdapterSkillSyncOptions,
   AdapterSessionCodec,
   AdapterModel,
   HireApprovedPayload,

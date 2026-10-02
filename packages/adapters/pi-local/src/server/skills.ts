@@ -5,10 +5,12 @@ import { fileURLToPath } from "node:url";
 import type {
   AdapterSkillContext,
   AdapterSkillSnapshot,
+  AdapterSkillSyncOptions,
 } from "@paperclipai/adapter-utils";
 import {
   buildPersistentSkillSnapshot,
   ensurePaperclipSkillSymlink,
+  isStalePaperclipManagedSkillLink,
   readPaperclipRuntimeSkillEntries,
   readInstalledSkillTargets,
   resolveLegacyPaperclipDesiredSkillNames,
@@ -55,12 +57,19 @@ export async function listPiSkills(ctx: AdapterSkillContext): Promise<AdapterSki
 export async function syncPiSkills(
   ctx: AdapterSkillContext,
   desiredSkills: string[],
+  options?: AdapterSkillSyncOptions,
 ): Promise<AdapterSkillSnapshot> {
   const availableEntries = await readPaperclipRuntimeSkillEntries(ctx.config, __moduleDir);
   const desiredSet = new Set([
     ...resolveLegacyPaperclipDesiredSkillNames({}, availableEntries),
     ...desiredSkills,
   ]);
+  // Union of desired keys across every pi_local agent sharing this skills
+  // home. Pruning consults the union so one agent's sync never removes a
+  // skill another agent still wants. Absent (single-agent) falls back to
+  // the per-agent set, preserving prior behavior exactly.
+  const unionSet = new Set(desiredSet);
+  for (const key of options?.unionDesiredSkills ?? []) unionSet.add(key);
   const skillsHome = resolvePiSkillsHome(ctx.config);
   await fs.mkdir(skillsHome, { recursive: true });
   const installed = await readInstalledSkillTargets(skillsHome);
@@ -74,10 +83,25 @@ export async function syncPiSkills(
 
   for (const [name, installedEntry] of installed.entries()) {
     const available = availableByRuntimeName.get(name);
+    // Unknown names (.bak-* dirs, demo-skill, user installs) are never touched.
     if (!available) continue;
-    if (desiredSet.has(available.key)) continue;
-    if (installedEntry.targetPath !== available.source) continue;
-    await fs.unlink(path.join(skillsHome, name)).catch(() => {});
+    // Desired by somebody in the union: keep, even if this agent dropped it.
+    if (unionSet.has(available.key)) continue;
+    // Prune only Paperclip-managed links: exact current-source matches plus
+    // stale links into retained old install roots. Live external symlinks
+    // (different leaf name or outside skill roots) are left alone.
+    if (installedEntry.kind !== "symlink") continue;
+    const targetPath = installedEntry.targetPath;
+    if (targetPath === available.source) {
+      await fs.unlink(path.join(skillsHome, name)).catch(() => {});
+      continue;
+    }
+    if (
+      targetPath &&
+      isStalePaperclipManagedSkillLink(targetPath, available.source)
+    ) {
+      await fs.unlink(path.join(skillsHome, name)).catch(() => {});
+    }
   }
 
   return buildPiSkillSnapshot(ctx.config);

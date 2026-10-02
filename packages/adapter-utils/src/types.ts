@@ -453,13 +453,24 @@ export interface AcpTargetDescriptor {
   };
 }
 
+export interface AdapterSkillSyncOptions {
+  /**
+   * Union of desired skill keys across all agents sharing the same
+   * skills home (e.g. every pi_local agent under ~/.pi/agent/skills).
+   * The adapter must prune only keys desired by NOBODY in this union.
+   * When absent, the adapter falls back to the per-agent desired set
+   * (single-agent deployments behave exactly as before).
+   */
+  unionDesiredSkills?: string[];
+}
+
 export interface ServerAdapterModule {
   type: string;
   execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult>;
   testEnvironment(ctx: AdapterEnvironmentTestContext): Promise<AdapterEnvironmentTestResult>;
   acp?: AcpTargetDescriptor;
   listSkills?: (ctx: AdapterSkillContext) => Promise<AdapterSkillSnapshot>;
-  syncSkills?: (ctx: AdapterSkillContext, desiredSkills: string[]) => Promise<AdapterSkillSnapshot>;
+  syncSkills?: (ctx: AdapterSkillContext, desiredSkills: string[], options?: AdapterSkillSyncOptions) => Promise<AdapterSkillSnapshot>;
   sessionCodec?: AdapterSessionCodec;
   sessionManagement?: import("./session-compaction.js").AdapterSessionManagement;
   supportsLocalAgentJwt?: boolean;

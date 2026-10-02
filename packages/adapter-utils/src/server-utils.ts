@@ -4331,6 +4331,37 @@ export function writePaperclipSkillSyncPreference(
   return next;
 }
 
+function looksLikePaperclipManagedSkillSource(candidate: string): boolean {
+  const normalized = normalizePathSlashes(candidate);
+  return (
+    normalized.includes("/skills/") ||
+    normalized.includes("/installs/") ||
+    normalized.includes("/skills-releases/")
+  );
+}
+
+/**
+ * True when an installed symlink points at a retained older Paperclip skill
+ * source for the same skill (same leaf directory name, both paths look like
+ * Paperclip-managed skill sources) instead of the current source. Such links
+ * are live — the old install dir is retained — so the plain dangling-link
+ * repair never fires; callers must re-point them at the current source.
+ * User-installed entries (different leaf name, or paths outside Paperclip
+ * skill roots) are never classified as stale.
+ */
+export function isStalePaperclipManagedSkillLink(
+  resolvedLinkedPath: string,
+  source: string,
+): boolean {
+  if (resolvedLinkedPath === source) return false;
+  if (path.basename(resolvedLinkedPath) !== path.basename(source))
+    return false;
+  return (
+    looksLikePaperclipManagedSkillSource(resolvedLinkedPath) &&
+    looksLikePaperclipManagedSkillSource(source)
+  );
+}
+
 export async function ensurePaperclipSkillSymlink(
   source: string,
   target: string,
@@ -4362,6 +4393,13 @@ export async function ensurePaperclipSkillSymlink(
     .then(() => true)
     .catch(() => false);
   if (linkedPathExists) {
+    // Live link into a retained old install root for the same skill: re-point
+    // at the current source. Anything else live is external/user-installed.
+    if (isStalePaperclipManagedSkillLink(resolvedLinkedPath, source)) {
+      await fs.unlink(target);
+      await linkSkill(source, target);
+      return "repaired";
+    }
     return "skipped";
   }
 
