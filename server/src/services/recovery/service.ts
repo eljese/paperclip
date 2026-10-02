@@ -4,9 +4,10 @@ import { settleSlackConversation } from "../slack-conversation-lifecycle.js";
 import { externalConversationStateSql } from "../slack-conversation-state.js";
 import { executionRetryAccounting } from "../execution-recovery-attempt.js";
 import {
-  HOST_OOM_ERROR_CODE,
+  hostOomConfidenceForErrorCode,
   attributeHostOomErrorCode,
   isHostOomActive,
+  isHostOomErrorCode,
 } from "../host-oom.js";
 import {
   decideLegacyContinuation, legacyDispositionEpisode, legacyDispositionFingerprint,
@@ -5933,17 +5934,28 @@ export function recoveryService(
     const baseErrorCode = issueTerminalStatus
       ? "orphaned_running_run_issue_terminal"
       : "orphaned_running_run";
-    // OOM-aware settlement (JES-342): attribute host-OOM deaths with a
-    // distinct code. Best-effort, never blocks terminalization.
+    // OOM-aware settlement (JES-342, follow-up 2026-10-02): attribute host-OOM
+    // deaths with a distinct code. Orphaned-run terminalization carries no
+    // exit/signal, so a service marker/cgroup reason confirms host_oom_kill
+    // and a bare time window stays host_oom_suspected. Best-effort, never
+    // blocks terminalization.
     let errorCode = baseErrorCode;
+    let hostOomConfidence: "confirmed" | "suspected" | null = null;
     try {
-      if (!issueTerminalStatus && isHostOomActive().active) {
-        errorCode = attributeHostOomErrorCode(baseErrorCode, true);
+      if (!issueTerminalStatus) {
+        const oomState = isHostOomActive();
+        if (oomState.active) {
+          errorCode = attributeHostOomErrorCode(baseErrorCode, true, {
+            oomReason: oomState.reason,
+          });
+          hostOomConfidence = hostOomConfidenceForErrorCode(errorCode);
+        }
       }
     } catch {
       errorCode = baseErrorCode;
+      hostOomConfidence = null;
     }
-    const hostOomAttributed = errorCode === HOST_OOM_ERROR_CODE;
+    const hostOomAttributed = isHostOomErrorCode(errorCode);
     const message =
       authority === "issue_terminal"
         ? "run terminalized by recovery backstop: issue reached a terminal status while heartbeat_runs.status stayed live"
@@ -6046,7 +6058,15 @@ export function recoveryService(
           ...(issueId ? { issueId } : {}),
           pid,
           processGroupId,
-          ...(hostOomAttributed ? { hostOomAttributed: true, errorCode } : {}),
+          ...(hostOomAttributed
+            ? {
+                hostOomAttributed: true,
+                errorCode,
+                ...(hostOomConfidence
+                  ? { hostOomConfidence }
+                  : {}),
+              }
+            : {}),
         },
       });
     } catch (error) {

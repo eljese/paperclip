@@ -51,13 +51,14 @@ import {
 } from "./adapter-execution-control.js";
 import { executionFailureRetryCount, executionRetryAttemptCount, accountingForScheduledRetry } from "./execution-recovery-attempt.js";
 import {
-  HOST_OOM_ERROR_CODE,
   HOST_OOM_MAX_ATTEMPTS,
   HOST_OOM_RETRY_REASON,
   HOST_OOM_RETRY_WAKE_REASON,
   attributeHostOomErrorCode,
   computeHostOomRetrySchedule,
+  hostOomConfidenceForErrorCode,
   isHostOomActive,
+  isHostOomErrorCode,
   isHostOomRetryEnabled,
 } from "./host-oom.js";
 import { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
@@ -15326,7 +15327,7 @@ export function heartbeatService(
     // the bounded failure budget. Feature-flagged; when disabled, OOM runs
     // fall back to the legacy bounded schedule. Explicit caller lanes
     // (max-turn, interaction infra, workspace/ai waits) are never overridden.
-    const isOomAttributedRun = run.errorCode === HOST_OOM_ERROR_CODE;
+    const isOomAttributedRun = isHostOomErrorCode(run.errorCode);
     const callerUsesDefaultLane =
       opts?.retryReason === undefined ||
       opts?.retryReason === BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON;
@@ -19370,22 +19371,33 @@ export function heartbeatService(
       if (!(await revokeExpiredLegacyController(db, run))) continue;
       const baseMessage = buildProcessLossMessage(run);
       const conversationContinuationEligible = await runUsedConversationAdapter(db, run);
-      // OOM-aware settlement (JES-342): when host-OOM pressure is active,
-      // record host_oom_kill instead of generic process_lost. Detection is
-      // best-effort and never blocks settlement.
+      // OOM-aware settlement (JES-342, follow-up 2026-10-02): when host-OOM
+      // pressure is active, record host_oom_kill (exit/signal- or
+      // service-correlated) or host_oom_suspected (time-window-only) instead
+      // of generic process_lost. Detection is best-effort and never blocks
+      // settlement. process_lost carries no exit/signal, so a service marker
+      // or cgroup oom_kill reason confirms it; a bare env/time window stays
+      // suspected to avoid relabeling generic failures.
       let processLossErrorCode = "process_lost";
       let processLossHostOom = false;
+      let processLossHostOomConfidence: "confirmed" | "suspected" | null = null;
       try {
-        if (isHostOomActive({ env: runtimeEnv }).active) {
-          const attributed = attributeHostOomErrorCode("process_lost", true);
-          if (attributed === HOST_OOM_ERROR_CODE) {
+        const oomState = isHostOomActive({ env: runtimeEnv });
+        if (oomState.active) {
+          const attributed = attributeHostOomErrorCode("process_lost", true, {
+            oomReason: oomState.reason,
+          });
+          if (isHostOomErrorCode(attributed)) {
             processLossErrorCode = attributed;
             processLossHostOom = true;
+            processLossHostOomConfidence =
+              hostOomConfidenceForErrorCode(attributed);
           }
         }
       } catch {
         processLossErrorCode = "process_lost";
         processLossHostOom = false;
+        processLossHostOomConfidence = null;
       }
 
       const failureWrite = await setRunStatusFromLive(
@@ -19469,7 +19481,15 @@ export function heartbeatService(
           ...(run.processPid ? { processPid: run.processPid } : {}),
           ...(run.processGroupId ? { processGroupId: run.processGroupId } : {}),
           ...(retriedRun ? { retryRunId: retriedRun.id } : {}),
-          ...(processLossHostOom ? { hostOomAttributed: true, errorCode: processLossErrorCode } : {}),
+          ...(processLossHostOom
+            ? {
+                hostOomAttributed: true,
+                errorCode: processLossErrorCode,
+                ...(processLossHostOomConfidence
+                  ? { hostOomConfidence: processLossHostOomConfidence }
+                  : {}),
+              }
+            : {}),
         },
       });
 
@@ -25152,18 +25172,24 @@ export function heartbeatService(
                   recordedResponsibleUserDenialCode ??
                   "adapter_failed")
                 : null;
-        // OOM-aware settlement (JES-342): attribute generic adapter deaths to
-        // host_oom_kill while host-OOM pressure is active. Non-OOM failures
-        // keep the exact original code.
+        // OOM-aware settlement (JES-342, follow-up 2026-10-02): attribute
+        // generic adapter deaths while host-OOM pressure is active. Exit 143 /
+        // SIGTERM/SIGKILL or a service marker/cgroup reason confirms
+        // host_oom_kill; a bare time window stays host_oom_suspected so generic
+        // failures are not relabeled. Non-OOM failures keep the exact code.
         const runErrorCode =
           baseRunErrorCode !== null
             ? (() => {
                 try {
-                  if (outcome === "failed" && isHostOomActive({ env: runtimeEnv }).active) {
-                    return attributeHostOomErrorCode(baseRunErrorCode, true, {
-                      exitCode: adapterResult.exitCode ?? null,
-                      signal: adapterResult.signal ?? null,
-                    });
+                  if (outcome === "failed") {
+                    const oomState = isHostOomActive({ env: runtimeEnv });
+                    if (oomState.active) {
+                      return attributeHostOomErrorCode(baseRunErrorCode, true, {
+                        exitCode: adapterResult.exitCode ?? null,
+                        signal: adapterResult.signal ?? null,
+                        oomReason: oomState.reason,
+                      });
+                    }
                   }
                 } catch {
                   // Detection never blocks settlement.
@@ -25890,11 +25916,16 @@ export function heartbeatService(
           recordedResponsibleUserDenialCode ??
           nativeTerminalFailureCode ??
           "adapter_failed";
-        // OOM-aware settlement (JES-342): see adapter-result path above.
+        // OOM-aware settlement (JES-342, follow-up 2026-10-02): see
+        // adapter-result path above. Exception path carries no exit/signal,
+        // so only a service marker/cgroup reason confirms; otherwise suspected.
         const failureErrorCode = (() => {
           try {
-            if (isHostOomActive({ env: runtimeEnv }).active) {
-              return attributeHostOomErrorCode(baseFailureErrorCode, true);
+            const oomState = isHostOomActive({ env: runtimeEnv });
+            if (oomState.active) {
+              return attributeHostOomErrorCode(baseFailureErrorCode, true, {
+                oomReason: oomState.reason,
+              });
             }
           } catch {
             // Detection never blocks settlement.

@@ -1,13 +1,16 @@
 import { describe, expect, it } from "vitest";
 import {
   HOST_OOM_ERROR_CODE,
+  HOST_OOM_SUSPECTED_ERROR_CODE,
   HOST_OOM_MAX_ATTEMPTS,
   HOST_OOM_RETRY_DELAYS_MS,
   HOST_OOM_RETRY_REASON,
   attributeHostOomErrorCode,
   computeHostOomRetrySchedule,
+  hostOomConfidenceForErrorCode,
   isGenericInfraDeathCode,
   isHostOomActive,
+  isHostOomErrorCode,
   isHostOomRetryEnabled,
   readMemoryEventsOomKill,
   shouldSuppressDispatchDueToHostOom,
@@ -113,14 +116,76 @@ describe("host-oom detection (JES-342)", () => {
   });
 });
 
-describe("host-oom attribution (JES-342)", () => {
+describe("host-oom attribution (JES-342, follow-up: suspected vs confirmed)", () => {
   it.each(["process_lost", "adapter_failed", "orphaned_running_run", "orphaned_running_run_issue_terminal"])(
-    "records distinct error_code for %s when OOM is active",
+    "marks %s as suspected on a bare time window (no exit/signal correlation)",
     (code) => {
       expect(isGenericInfraDeathCode(code)).toBe(true);
-      expect(attributeHostOomErrorCode(code, true)).toBe(HOST_OOM_ERROR_CODE);
+      expect(attributeHostOomErrorCode(code, true)).toBe(
+        HOST_OOM_SUSPECTED_ERROR_CODE,
+      );
+      expect(isHostOomErrorCode(HOST_OOM_SUSPECTED_ERROR_CODE)).toBe(true);
+      expect(hostOomConfidenceForErrorCode(HOST_OOM_SUSPECTED_ERROR_CODE)).toBe(
+        "suspected",
+      );
     },
   );
+
+  it.each(["process_lost", "adapter_failed", "orphaned_running_run"])(
+    "confirms %s on exit 143 (SIGTERM teardown)",
+    (code) => {
+      expect(
+        attributeHostOomErrorCode(code, true, { exitCode: 143 }),
+      ).toBe(HOST_OOM_ERROR_CODE);
+    },
+  );
+
+  it.each(["SIGTERM", "sigterm", "SIGKILL", "15"])(
+    "confirms adapter_failed on signal %s",
+    (signal) => {
+      expect(
+        attributeHostOomErrorCode("adapter_failed", true, { signal }),
+      ).toBe(HOST_OOM_ERROR_CODE);
+    },
+  );
+
+  it("confirms on service-correlated marker/cgroup evidence without exit info", () => {
+    expect(
+      attributeHostOomErrorCode("process_lost", true, {
+        oomReason: "marker_file",
+      }),
+    ).toBe(HOST_OOM_ERROR_CODE);
+    expect(
+      attributeHostOomErrorCode("orphaned_running_run", true, {
+        oomReason: "cgroup_oom_kill",
+      }),
+    ).toBe(HOST_OOM_ERROR_CODE);
+    expect(hostOomConfidenceForErrorCode(HOST_OOM_ERROR_CODE)).toBe(
+      "confirmed",
+    );
+  });
+
+  it("keeps env-override-only pressure as suspected (no silent relabel)", () => {
+    expect(
+      attributeHostOomErrorCode("adapter_failed", true, {
+        oomReason: "env_override",
+      }),
+    ).toBe(HOST_OOM_SUSPECTED_ERROR_CODE);
+  });
+
+  it("prefers persistent marker evidence outside the recreated cgroup", () => {
+    const nowMs = 1_700_000_000_000;
+    const persistent = "/var/lib/paperclipai/host-oom";
+    const fs = {
+      existsSync: (p: string) => p === persistent,
+      readFileSync: () => "",
+      statSync: () => ({ mtimeMs: nowMs - 60_000 }),
+    };
+    expect(isHostOomActive({ env: {}, fs, nowMs })).toMatchObject({
+      active: true,
+      reason: "marker_file",
+    });
+  });
 
   it("keeps the generic code when OOM is not active (no behavior change)", () => {
     for (const code of ["process_lost", "adapter_failed", "orphaned_running_run"]) {

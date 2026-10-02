@@ -5,8 +5,10 @@
  * OOM killer terminates `paperclipai.service` and all in-flight pi child
  * processes with the cgroup (SIGTERM -> exit 143, or abrupt pid-gone).
  * Those deaths are infrastructure faults, not agent faults. They must:
- *  - settle with a distinct error_code (`host_oom_kill`) instead of the
- *    generic `process_lost` / `adapter_failed` / `orphaned_running_run`,
+ *  - settle with a distinct error_code (`host_oom_kill` when exit/signal- or
+ *    service-correlated, `host_oom_suspected` for time-window-only pressure)
+ *    instead of the generic `process_lost` / `adapter_failed` /
+ *    `orphaned_running_run`,
  *  - retry with exponential backoff (2m -> 8m -> 30m) on a separate
  *    infra-retry budget that does NOT consume the bounded failure budget,
  *  - pause new dispatch while host-OOM pressure is active.
@@ -22,6 +24,13 @@ import {
 } from "node:fs";
 
 export const HOST_OOM_ERROR_CODE = "host_oom_kill" as const;
+/** Time-window-only attribution: OOM pressure was active but the death is
+ *  not exit/signal-correlated to the affected service/run. Kept distinct so
+ *  a 30-minute window cannot silently relabel generic failures as confirmed
+ *  OOM kills. Both codes use the same infra-retry lane (no bounded-budget
+ *  spend); the code + confidence flag preserve the signal strength. */
+export const HOST_OOM_SUSPECTED_ERROR_CODE = "host_oom_suspected" as const;
+export type HostOomConfidence = "confirmed" | "suspected";
 export const HOST_OOM_RETRY_REASON = "host_oom_retry" as const;
 export const HOST_OOM_RETRY_WAKE_REASON = "host_oom_retry" as const;
 
@@ -40,6 +49,18 @@ const GENERIC_INFRA_DEATH_CODES = new Set<string>([
 
 export function isGenericInfraDeathCode(code: string | null | undefined): boolean {
   return typeof code === "string" && GENERIC_INFRA_DEATH_CODES.has(code);
+}
+
+export function isHostOomErrorCode(code: string | null | undefined): boolean {
+  return code === HOST_OOM_ERROR_CODE || code === HOST_OOM_SUSPECTED_ERROR_CODE;
+}
+
+export function hostOomConfidenceForErrorCode(
+  code: string | null | undefined,
+): HostOomConfidence | null {
+  if (code === HOST_OOM_ERROR_CODE) return "confirmed";
+  if (code === HOST_OOM_SUSPECTED_ERROR_CODE) return "suspected";
+  return null;
 }
 
 export function isHostOomRetryEnabled(
@@ -66,24 +87,66 @@ export function readHostOomEnvOverride(
  * Returns the original code unchanged for non-OOM failures (no behavior change),
  * for specific non-generic codes (validation, auth, quota, ...), and when OOM
  * is not active. Never throws.
+ *
+ * Confidence (follow-up review, 2026-10-02): the 30-minute active window alone
+ * is NOT enough to confirm an OOM kill, otherwise generic failures inside the
+ * window get relabeled. Exit/signal inputs are now honored:
+ *  - confirmed (`host_oom_kill`): exit 143 (128+15 SIGTERM, the classic
+ *    cgroup-wide SIGTERM teardown) or signal SIGTERM/SIGKILL, OR
+ *    service-correlated evidence (`oomReason` marker_file/cgroup_oom_kill for
+ *    the paperclipai.service unit paths).
+ *  - suspected (`host_oom_suspected`): pressure active (e.g. env override or
+ *    bare time window) but no exit/signal or service correlation for this run.
  */
 export function attributeHostOomErrorCode(
   originalCode: string,
   oomActive: boolean,
-  opts?: { exitCode?: number | null; signal?: string | null },
+  opts?: {
+    exitCode?: number | null;
+    signal?: string | null;
+    oomReason?: "env_override" | "marker_file" | "cgroup_oom_kill" | null;
+  },
 ): string {
   try {
     if (!oomActive) return originalCode;
-    if (originalCode === HOST_OOM_ERROR_CODE) return originalCode;
+    if (isHostOomErrorCode(originalCode)) return originalCode;
     if (!isGenericInfraDeathCode(originalCode)) return originalCode;
-    // Exit 143 (128+15 SIGTERM) is the classic cgroup-wide SIGTERM teardown
-    // signature of a host-OOM kill. When OOM pressure is active we attribute
-    // any generic infra death (including non-143) to keep the signal strong;
-    // the exit/signal is preserved in the run event payload by callers.
-    void opts;
-    return HOST_OOM_ERROR_CODE;
+    if (isConfirmedHostOomDeath(opts)) return HOST_OOM_ERROR_CODE;
+    return HOST_OOM_SUSPECTED_ERROR_CODE;
   } catch {
     return originalCode;
+  }
+}
+
+function normalizeHostOomSignal(signal: string | null | undefined): string | null {
+  if (typeof signal !== "string") return null;
+  const s = signal.trim().toUpperCase();
+  if (!s) return null;
+  // Accept "SIGTERM", "TERM", "15", and the SIGKILL equivalents: the
+  // kernel OOM killer delivers SIGKILL while systemd cgroup teardown after
+  // OOMPolicy=stop surfaces as SIGTERM (exit 143) to children.
+  if (s === "SIGTERM" || s === "TERM" || s === "15") return "SIGTERM";
+  if (s === "SIGKILL" || s === "KILL" || s === "9") return "SIGKILL";
+  return s;
+}
+
+function isConfirmedHostOomDeath(opts?: {
+  exitCode?: number | null;
+  signal?: string | null;
+  oomReason?: "env_override" | "marker_file" | "cgroup_oom_kill" | null;
+}): boolean {
+  try {
+    if (opts?.exitCode === 143) return true;
+    const sig = normalizeHostOomSignal(opts?.signal);
+    if (sig === "SIGTERM" || sig === "SIGKILL") return true;
+    // Service-correlated evidence: marker file or the paperclipai.service
+    // cgroup memory.events oom_kill (not just a bare env/time window).
+    if (opts?.oomReason === "marker_file" || opts?.oomReason === "cgroup_oom_kill") {
+      return true;
+    }
+    return false;
+  } catch {
+    return false;
   }
 }
 
@@ -153,7 +216,16 @@ function defaultMarkerPaths(
   env: Record<string, string | undefined>,
 ): string[] {
   const override = env.PAPERCLIP_HOST_OOM_MARKER_FILE?.trim();
+  // NOTE (2026-10-02 follow-up, read-only host evidence): cgroup
+  // memory.events oom_kill counters reset when the unit cgroup is recreated
+  // (observed 0 after the Oct 2 paperclipai.service restart), and the unit
+  // has no OnFailure/ExecStopPost marker writer. /run and /tmp are tmpfs
+  // (cleared on reboot), so a persistent path outside the recreated cgroup
+  // is required for evidence to survive restarts. /var/lib/... is checked
+  // first; mtime recency still bounds the active window to 30m. No host
+  // config changes in this PR (ops follow-up owns the unit writer).
   return [...new Set([...(override ? [override] : []),
+    "/var/lib/paperclipai/host-oom",
     "/run/paperclipai/host-oom",
     "/tmp/paperclipai-host-oom",
   ])];
