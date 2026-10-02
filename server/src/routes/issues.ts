@@ -4976,9 +4976,13 @@ export function issueRoutes(
     issue: { identifier?: string | null; assigneeAgentId: string | null },
     code: IssueWriteDenialCode,
     extraDetails: Record<string, unknown> = {},
+    extraContext: Partial<IssueWriteDenialContext> = {},
   ) {
     const labels = await issueWriteDenialLabels(req, issue);
-    const { status, body } = issueWriteDenialResponse(code, labels);
+    const { status, body } = issueWriteDenialResponse(code, {
+      ...labels,
+      ...extraContext,
+    });
     res.status(status).json({
       error: body.error,
       details: { ...body.details, ...extraDetails },
@@ -5130,6 +5134,74 @@ export function issueRoutes(
     return null;
   }
 
+  // Terminal heartbeat-run statuses. Mirrors TERMINAL_HEARTBEAT_RUN_STATUSES in
+  // services/issues.ts — kept local because the route test harness mocks that
+  // module wholesale, and a dead-run denial must never depend on a mock.
+  const TERMINAL_CHECKOUT_RUN_STATUSES = new Set([
+    "succeeded",
+    "interrupted",
+    "failed",
+    "cancelled",
+    "timed_out",
+  ]);
+
+  /**
+   * Best-effort holder-run liveness for the run-lock denial copy.
+   *
+   * A dead holder run (terminal status, or the run row is gone) means the lock
+   * will never clear on its own, so the copy must name the release path instead
+   * of telling the operator to wait. Live runs, unknown runs (no checkoutRunId),
+   * and lookup failures all keep today's copy semantics.
+   */
+  async function describeCheckoutRunLockForDenial(
+    checkoutRunId: string | null | undefined,
+  ): Promise<{ details: Record<string, unknown>; context: Partial<IssueWriteDenialContext> }> {
+    if (!checkoutRunId) return { details: {}, context: {} };
+    const details: Record<string, unknown> = { checkoutRunId };
+    const context: Partial<IssueWriteDenialContext> = { checkoutRunId };
+    try {
+      const run = await db
+        .select({
+          status: heartbeatRuns.status,
+          finishedAt: heartbeatRuns.finishedAt,
+          updatedAt: heartbeatRuns.updatedAt,
+        })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, checkoutRunId))
+        .then((rows) => rows[0] ?? null);
+      if (!run) {
+        return {
+          details: { ...details, checkoutRunDead: true },
+          context: { ...context, checkoutRunDead: true },
+        };
+      }
+      if (!TERMINAL_CHECKOUT_RUN_STATUSES.has(run.status)) {
+        return { details, context };
+      }
+      const deadSince = (run.finishedAt ?? run.updatedAt)?.toISOString() ?? null;
+      return {
+        details: {
+          ...details,
+          checkoutRunDead: true,
+          checkoutRunStatus: run.status,
+          checkoutRunDeadSince: deadSince,
+        },
+        context: {
+          ...context,
+          checkoutRunDead: true,
+          checkoutRunStatus: run.status,
+          checkoutRunDeadSince: deadSince,
+        },
+      };
+    } catch (err) {
+      logger.warn(
+        { err },
+        "failed to resolve checkout run liveness for issue write denial copy",
+      );
+      return { details, context };
+    }
+  }
+
   async function hasActiveCheckoutManagementOverride(
     actorAgentId: string,
     companyId: string,
@@ -5154,6 +5226,8 @@ export function issueRoutes(
       status: string;
       assigneeAgentId: string | null;
       assigneeUserId: string | null;
+      /** Holder of the run checkout lock; read only for denial copy. */
+      checkoutRunId?: string | null;
       reviewPolicy?: IssueReviewPolicy | null;
       /** Used only to name the task in denial copy (plan §6). */
       identifier?: string | null;
@@ -5225,7 +5299,9 @@ export function issueRoutes(
       }
       if (issue.status === "in_progress") {
         // Run/checkout ownership stays assignee-scoped even though writes are
-        // open, so this lock clears on its own — the copy routes to comments.
+        // open, so a *live* lock clears on its own — but a dead holder run
+        // never will, so the copy names the holder and the release path then.
+        const lock = await describeCheckoutRunLockForDenial(issue.checkoutRunId);
         return denyIssueWrite(
           req,
           res,
@@ -5235,7 +5311,9 @@ export function issueRoutes(
             issueId: issue.id,
             assigneeAgentId: issue.assigneeAgentId,
             actorAgentId,
+            ...lock.details,
           },
+          lock.context,
         );
       }
       // Past the run lock the issue is idle, so only channels that have not
