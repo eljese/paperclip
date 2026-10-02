@@ -14,6 +14,7 @@ import { deliverExecutionStatuses } from "./services/execution-status-delivery.j
 import { deliverReconciledExecutions, settleUnrecoverableExecutions } from "./services/execution-recovery-resolution.js";
 import { reconcileSafeNativeReplacements } from "./services/native-runtime/native-safe-replacement.js";
 import { reconcileAbandonedExecutionControl } from "./services/execution-control-reconciliation.js";
+import { sweepStaleCheckoutLocks } from "./services/checkout-lock-sweeper.js";
 import { EXECUTION_RECONCILIATION_INTERVAL_MS } from "./services/execution-control-deadline.js";
 import { connectionIntentDeliveryService } from "./services/connection-intent-delivery.js";
 import { existsSync, readFileSync, rmSync } from "node:fs";
@@ -1163,6 +1164,7 @@ async function startServerWithDatabaseTeardown(
     ["status_delivery", () => deliverExecutionStatuses(db)],
     ["automatic_disposition", () => settleUnrecoverableExecutions(db)],
     ["local_ai_login_cleanup", () => localAiLoginService(db).reapExpired()],
+    ["checkout_lock", () => (config.checkoutLockSweepEnabled ? sweepStaleCheckoutLocks(db, { deadMs: config.checkoutLockSweepDeadMinutes * 60_000 }) : undefined)],
   ] as const;
   const sweepExecutionControl = () => {
     if (heartbeatSchedulerStopped) return;

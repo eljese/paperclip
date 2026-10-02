@@ -1696,6 +1696,7 @@ export const PLUGIN_EVENT_TYPES = [
   "issue.document.deleted",
   "issue.relations.updated",
   "issue.checked_out",
+  "issue.checkout_lock_swept",
   "issue.released",
   "issue.assignment_wakeup_requested",
   "agent.created",
