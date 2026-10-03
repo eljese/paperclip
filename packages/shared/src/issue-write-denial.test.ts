@@ -107,6 +107,58 @@ describe("describeIssueWriteDenial", () => {
     expect(copy.sanctionedPath).toContain("CodexCoder");
   });
 
+  it("keeps live-run lock copy free of any dead claim", () => {
+    // Live semantics are the default: no run context at all, and an explicitly
+    // live holder run must render byte-identically to the shipped copy.
+    for (const context of [
+      { assigneeLabel: "CodexCoder" },
+      { assigneeLabel: "CodexCoder", checkoutRunId: "run-1", checkoutRunDead: false },
+    ]) {
+      const copy = describeIssueWriteDenial("issue_write_assignee_run_lock", context);
+      expect(copy.boundary).toBe("Run checkout lock");
+      expect(copy.title).toBe("Another agent's run owns this task");
+      expect(copy.description).toContain("a run is live");
+      const prose = `${copy.title} ${copy.description} ${copy.whoCanAct} ${copy.sanctionedPath}`;
+      expect(prose).not.toMatch(/dead|stale|terminal/i);
+    }
+  });
+
+  it("tells the operator who holds a dead lock, since when, and how to release it", () => {
+    const copy = describeIssueWriteDenial("issue_write_assignee_run_lock", {
+      assigneeLabel: "CodexCoder",
+      issueIdentifier: "TASK-482",
+      checkoutRunId: "run-9f2",
+      checkoutRunDead: true,
+      checkoutRunStatus: "failed",
+      checkoutRunDeadSince: "2026-10-01T12:00:00.000Z",
+    });
+    expect(copy.boundary).toBe("Stale run checkout lock");
+    expect(copy.title.toLowerCase()).toContain("dead");
+    expect(copy.description).toContain("CodexCoder");
+    expect(copy.description).toContain("TASK-482");
+    expect(copy.description).toContain("run-9f2");
+    expect(copy.description).toContain("failed");
+    expect(copy.description).toContain("2026-10-01T12:00:00.000Z");
+    // The sanctioned release path names both verified release routes.
+    expect(copy.sanctionedPath).toContain("POST /issues/:id/release");
+    expect(copy.sanctionedPath).toContain("POST /issues/:id/admin/force-release");
+    expect(copy.whoCanAct).toContain("board");
+  });
+
+  it("reports a dead lock with no recoverable death time without inventing one", () => {
+    const copy = describeIssueWriteDenial("issue_write_assignee_run_lock", {
+      assigneeLabel: "CodexCoder",
+      checkoutRunId: "run-9f2",
+      checkoutRunDead: true,
+    });
+    expect(copy.description).toContain("run-9f2");
+    expect(copy.description).toContain("no longer exists");
+    // No fabricated timestamp or status.
+    expect(copy.description).not.toMatch(/\d{4}-\d{2}-\d{2}/);
+    expect(copy.description).not.toContain('"');
+    expect(copy.sanctionedPath).toContain("POST /issues/:id/release");
+  });
+
   it("reuses responsible-user ceiling copy and keeps on-behalf-of terminology", () => {
     const ceiling = describeIssueWriteDenial("issue_write_responsible_user_ceiling", {
       responsibleUserName: "Dotta",

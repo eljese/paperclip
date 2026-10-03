@@ -75,6 +75,15 @@ export interface IssueWriteDenialContext {
   count?: number | null;
   /** ISO timestamp at which log-only rollout becomes enforcement. */
   enforceAt?: string | null;
+  // --- Run checkout lock context (additive; only the run-lock denial reads it).
+  /** Checkout run id holding the lock, when the issue names one. */
+  checkoutRunId?: string | null;
+  /** Whether the holder run is known dead (terminal status or missing run row). */
+  checkoutRunDead?: boolean | null;
+  /** Terminal status of the holder run, when dead and the status is known. */
+  checkoutRunStatus?: string | null;
+  /** ISO timestamp at which the holder run died, when determinable. */
+  checkoutRunDeadSince?: string | null;
 }
 
 export function isIssueWriteDenialCode(
@@ -203,7 +212,34 @@ export function describeIssueWriteDenial(
       };
     }
 
-    case "issue_write_assignee_run_lock":
+    case "issue_write_assignee_run_lock": {
+      if (context.checkoutRunDead) {
+        // A dead run can never release its own lock, so today's "wait for the
+        // run" advice would send the operator into the JES-289 trial-and-error
+        // detour. Name the holder, the death evidence, and both release routes.
+        const holder = context.checkoutRunId ? ` (${context.checkoutRunId})` : "";
+        const death = context.checkoutRunStatus
+          ? `it reached terminal status \"${context.checkoutRunStatus}\"` +
+            (context.checkoutRunDeadSince ? ` at ${context.checkoutRunDeadSince}` : "")
+          : `its run row no longer exists, so it can make no further progress`;
+        return {
+          code,
+          status: 409,
+          tone: "lock",
+          boundary: "Stale run checkout lock",
+          title: "A dead run still holds this task's checkout lock",
+          description:
+            `${assignee} has ${issue} checked out${holder}, but the holding run is dead: ` +
+            `${death}. The lock will not clear on its own — a sanctioned release has to run first.`,
+          whoCanAct:
+            `${assignee} from its next heartbeat run, or a board member. An agent holding the ` +
+            `manage-active-checkouts permission can edit the task but cannot release the lock.`,
+          sanctionedPath:
+            `Have ${assignee} call \`POST /issues/:id/release\` from its next run — the ` +
+            `assignee's new run adopts and clears the stale lock — or have a board member call ` +
+            `\`POST /issues/:id/admin/force-release\`. Comments still wake ${assignee} meanwhile.`,
+        };
+      }
       return {
         code,
         status: 409,
@@ -220,6 +256,7 @@ export function describeIssueWriteDenial(
           `Comment instead of patching — comments stay open and wake ${assignee} — or ` +
           `wait for the run to release the lock and retry.`,
       };
+    }
 
     case "cross_issue_influence_cap_exceeded": {
       const cap = context.cap ?? 20;
