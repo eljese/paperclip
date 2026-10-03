@@ -81,6 +81,7 @@ import {
   instanceSettingsService,
   reconcileBuiltInAgentsOnStartup,
   reconcileCodexLocalManagedHomesOnStartup,
+  reconcileManagedSkillLinksOnStartup,
   reconcilePersistedRuntimeServicesOnStartup,
   routineService,
   statusCardService,
@@ -1082,6 +1083,34 @@ async function startServerWithDatabaseTeardown(
     })
     .catch((err) => {
       logger.error({ err }, "startup reconciliation of built-in agents failed");
+    });
+
+  // Re-point stale Paperclip-managed skill symlinks for pi_local agents after
+  // an install switch (JES-251). Detects live links pointing at retained old
+  // install roots and triggers the union-aware sync (PR #18) for the affected
+  // agents only. Fire-safe; runs after the other startup reconciliations so
+  // the schema is stable and pi_local agents have been backfilled.
+  void reconcileManagedSkillLinksOnStartup(db)
+    .then((result) => {
+      if (
+        result.driftedAgents > 0
+        || result.resyncedAgents > 0
+        || result.failedAgents > 0
+      ) {
+        logger.warn(
+          {
+            scannedAgents: result.scannedAgents,
+            driftedAgents: result.driftedAgents,
+            resyncedAgents: result.resyncedAgents,
+            failedAgents: result.failedAgents,
+            resyncedAgentIds: result.resyncedAgentIds,
+          },
+          "reconciled stale managed skill links after install switch",
+        );
+      }
+    })
+    .catch((err) => {
+      logger.error({ err }, "startup reconciliation of managed skill links failed");
     });
 
   // Force the instance onto the Kubernetes sandbox provider when configured via
