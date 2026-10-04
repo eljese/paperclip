@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Db } from "@paperclipai/db";
 import {
   reconcileManagedSkillLinksOnStartup,
@@ -143,6 +143,105 @@ describe("reconcileManagedSkillLinksOnStartup", () => {
     expect(currentSource).not.toBe(oldSource);
   });
 
+  it("current target is a no-op when old and current sources exist under distinct install roots", async () => {
+    // Regression coverage for the bounded correction: the prior
+    // path-shape heuristic misclassified any link under
+    // /installs/<hash>/.../skills/... as drift, including a live link that
+    // already points at the *current* install. This test guards against
+    // that regression by setting up both old and current sources under
+    // distinct cli/installs/<hash>/ roots and pointing the live link at
+    // the current source — reconciliation must report zero drift, the
+    // link must remain untouched, and the sync must not be invoked.
+    const home = await fs.mkdtemp(
+      path.join(os.tmpdir(), "paperclip-msr-home-current-noop-"),
+    );
+    cleanupDirs.push(home);
+    const skillsHome = path.join(home, ".pi", "agent", "skills");
+    await fs.mkdir(skillsHome, { recursive: true });
+    const oldInstallRoot = path.join(root, "cli", "installs", "oldhash-noop");
+    const currentInstallRoot = path.join(root, "cli", "installs", "currenthash-noop");
+    const oldSource = await makeSkillSource(oldInstallRoot, "paperclip");
+    const currentSource = await makeSkillSource(currentInstallRoot, "paperclip");
+    // Live link already points at the current source — NOT stale.
+    await fs.symlink(currentSource, path.join(skillsHome, "paperclip"));
+
+    const rows: AgentRow[] = [
+      {
+        id: "agent-current",
+        companyId: "company-1",
+        adapterType: "pi_local",
+        adapterConfig: {
+          env: { HOME: home },
+          paperclipRuntimeSkills: runtimeEntries([
+            {
+              key: "paperclipai/paperclip/paperclip",
+              runtimeName: "paperclip",
+              source: currentSource,
+            },
+          ]),
+        },
+      },
+    ];
+    const beforeLink = await fs.readlink(path.join(skillsHome, "paperclip"));
+    const summary = await reconcileManagedSkillLinksOnStartup(makeDb(rows));
+    const afterLink = await fs.readlink(path.join(skillsHome, "paperclip"));
+
+    expect(summary.scannedAgents).toBe(1);
+    expect(summary.driftedAgents).toBe(0);
+    expect(summary.resyncedAgents).toBe(0);
+    expect(summary.resyncedAgentIds).toEqual([]);
+    expect(summary.failedAgents).toBe(0);
+    // Link target is byte-identical before and after reconciliation.
+    expect(afterLink).toBe(beforeLink);
+    expect(afterLink).toBe(currentSource);
+    // Sanity: the two sources really are distinct (the no-op classification
+    // isn't vacuous because the inputs collapsed).
+    expect(currentSource).not.toBe(oldSource);
+  });
+
+  it("detection explicitly classifies 'no-op' vs 'stale' under distinct install roots", async () => {
+    // Drives `__testing.detectPiSkillsHomeDrift` directly to lock in the
+    // classifier behavior the bounded correction depends on: a link at the
+    // current source is NOT drift, while a link at a distinct old source
+    // IS drift. Both must use distinct cli/installs/<hash>/ roots so the
+    // test exercises the production-shaped scenario, not a contrived
+    // single-source fixture.
+    const home = await fs.mkdtemp(
+      path.join(os.tmpdir(), "paperclip-msr-home-classifier-"),
+    );
+    cleanupDirs.push(home);
+    const skillsHome = path.join(home, ".pi", "agent", "skills");
+    await fs.mkdir(skillsHome, { recursive: true });
+    const oldInstallRoot = path.join(root, "cli", "installs", "oldhash-classifier");
+    const currentInstallRoot = path.join(root, "cli", "installs", "currenthash-classifier");
+    const oldSource = await makeSkillSource(oldInstallRoot, "paperclip");
+    const currentSource = await makeSkillSource(currentInstallRoot, "paperclip");
+    // Live link at the current source: detector must say no-op.
+    await fs.symlink(currentSource, path.join(skillsHome, "paperclip"));
+    const configCurrent = {
+      env: { HOME: home },
+      paperclipRuntimeSkills: [
+        {
+          key: "paperclipai/paperclip/paperclip",
+          runtimeName: "paperclip",
+          source: currentSource,
+        },
+      ],
+    };
+    const noop = await __testing.detectPiSkillsHomeDrift(configCurrent);
+    expect(noop.drifted).toBe(false);
+    expect(noop.driftedNames).toEqual([]);
+    expect(noop.skillsHome).toBe(skillsHome);
+
+    // Now flip the live link to point at the old source: detector must
+    // say drift, naming exactly that leaf.
+    await fs.unlink(path.join(skillsHome, "paperclip"));
+    await fs.symlink(oldSource, path.join(skillsHome, "paperclip"));
+    const stale = await __testing.detectPiSkillsHomeDrift(configCurrent);
+    expect(stale.drifted).toBe(true);
+    expect(stale.driftedNames).toEqual(["paperclip"]);
+  });
+
   it("never touches user-installed entries (different leaf name preserved)", async () => {
     const home = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-msr-home-user-"));
     cleanupDirs.push(home);
@@ -190,16 +289,18 @@ describe("reconcileManagedSkillLinksOnStartup", () => {
     expect(await fs.readlink(path.join(skillsHome, "my-custom-skill"))).toBe(userSource);
   });
 
-  it("preserves a sibling agent's desired skill across the union (multi-agent shared home)", async () => {
+  it("preserves a sibling agent's desired skill across the union without repeatedly syncing an already-repaired sibling (multi-agent shared home)", async () => {
     const home = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-msr-home-union-"));
     cleanupDirs.push(home);
     const skillsHome = path.join(home, ".pi", "agent", "skills");
     await fs.mkdir(skillsHome, { recursive: true });
-    // Two skills available; only one (alpha) needs repair, the other (beta)
-    // is already current. Sibling agent only wants beta; this agent wants
-    // alpha. Drift exists for alpha — sync must re-point it without
-    // touching beta. Both sources for each skill use the same leaf name so
-    // PR #18's stale classifier matches.
+    // Two skills available; only one (alpha) starts stale, the other (beta)
+    // is already current. This agent wants alpha; the sibling wants beta.
+    // Drift exists for alpha on first detection — sync must re-point it
+    // and union-ensure beta without dropping beta. After this agent's sync
+    // fixes alpha, the sibling's detector must see zero drift and skip its
+    // sync entirely (no redundant re-pass). Both sources for each skill
+    // use the same leaf name so PR #18's stale classifier matches.
     const oldInstallRoot = path.join(root, "cli", "installs", "oldhash-union");
     const currentInstallRoot = path.join(root, "cli", "installs", "currenthash-union");
     const oldAlpha = await makeSkillSource(oldInstallRoot, "alpha");
@@ -238,18 +339,20 @@ describe("reconcileManagedSkillLinksOnStartup", () => {
     ];
     const summary = await reconcileManagedSkillLinksOnStartup(makeDb(rows));
     expect(summary.scannedAgents).toBe(2);
-    // Both agents share the skills home, so each independently detects the
-    // stale alpha and triggers the sync. Both syncs run; the union-aware
-    // semantics ensure beta survives across both passes.
-    expect(summary.driftedAgents).toBe(2);
-    expect(summary.resyncedAgents).toBe(2);
-    expect(summary.resyncedAgentIds.sort()).toEqual(["agent-sibling", "agent-this"]);
-    // Alpha re-pointed to current install root by the first sync that runs.
+    // Only the first agent (whichever iteration order reaches the home
+    // first) detects drift, because the second agent's detector sees the
+    // already-repaired alpha and the already-current beta — both classify
+    // as not-stale via `isStalePaperclipManagedSkillLink`. This is the
+    // "without repeatedly syncing an already-repaired sibling" invariant.
+    expect(summary.driftedAgents).toBe(1);
+    expect(summary.resyncedAgents).toBe(1);
+    expect(summary.resyncedAgentIds).toHaveLength(1);
+    // Alpha re-pointed to the current install root by whichever agent ran first.
     expect(
       path.resolve(skillsHome, await fs.readlink(path.join(skillsHome, "alpha"))),
     ).toBe(currentAlpha);
-    // Beta untouched (sibling agent still wants it; the union-aware sync
-    // composed with PR #18 must not prune it).
+    // Beta is preserved (union-aware sync composed with PR #18 must not
+    // prune it just because this agent doesn't desire beta directly).
     expect(await fs.readlink(path.join(skillsHome, "beta"))).toBe(currentBeta);
   });
 
@@ -281,12 +384,12 @@ describe("reconcileManagedSkillLinksOnStartup", () => {
     const homeA = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-msr-home-a-"));
     const homeB = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-msr-home-b-"));
     cleanupDirs.push(homeA, homeB);
-    // Agent A: drift detected via old install root, but the agent config has
-    // no runtime skill entries pointing at any currently-known source. The
-    // union-aware sync cannot re-point what it doesn't know about, so the
-    // re-sync is effectively a no-op for A — that's recorded as a successful
-    // detection + sync (drift confirmed and acted on; the absence of a known
-    // current source means there's nothing to re-point to). Agent A's stale
+    // Agent A: a stale link exists in its skills home, but its config has
+    // no `paperclipRuntimeSkills` and no moduleDir-resolvable bundled
+    // skills. The detector has no current source to compare against, so it
+    // cannot prove staleness (the heuristic-free pre-check requires a
+    // matching available entry to classify drift). Agent A is a true no-op:
+    // no drift detected, no sync attempted, no failure recorded. Its stale
     // link remains in place but does not abort the sweep.
     const skillsHomeA = path.join(homeA, ".pi", "agent", "skills");
     await fs.mkdir(skillsHomeA, { recursive: true });
@@ -331,9 +434,12 @@ describe("reconcileManagedSkillLinksOnStartup", () => {
     const summary = await reconcileManagedSkillLinksOnStartup(makeDb(rows));
     expect(summary.scannedAgents).toBe(2);
     expect(summary.driftedAgents).toBeGreaterThanOrEqual(1);
-    // Agent B succeeds; agent A's sync runs but cannot re-point (no known
-    // current source) — neither blocks the other.
+    // Agent B succeeds; agent A's no-op (no source to compare against)
+    // does not block the sweep. With the pre-check based on
+    // `isStalePaperclipManagedSkillLink`, A classifies as not-drift, so it
+    // never enters the sync path and is absent from resyncedAgentIds.
     expect(summary.resyncedAgentIds).toContain("agent-b");
+    expect(summary.failedAgents).toBe(0);
     expect(
       path.resolve(skillsHomeB, await fs.readlink(path.join(skillsHomeB, "paperclip"))),
     ).toBe(currentSourceB);
@@ -386,5 +492,212 @@ describe("reconcileManagedSkillLinksOnStartup", () => {
     expect(__testing.resolvePiSkillsHome({ env: { HOME: "   " } })).toBe(
       path.join(os.homedir(), ".pi", "agent", "skills"),
     );
+  });
+
+  // JES-421 regression coverage: env.HOME is persisted as a binding object
+  // (canonical shape written by `normalizeEnvConfig` on every create/update),
+  // not a plain string. Pre-merge QA on the prior PR #23 head found the
+  // startup reconciliation silently no-op'd for API-created agents because
+  // `resolvePiSkillsHome` required a plain string. These tests pin the fix.
+  describe("env.HOME as persisted binding object (JES-421)", () => {
+    it("resolves a plain binding's value to the agent's actual skills home", () => {
+      // The canonical shape `normalizeEnvConfig` writes on every create/update:
+      // `env.HOME = { type: "plain", value: "<path>" }`. Pre-fix, the typeof
+      // check rejected this and the function fell back to os.homedir().
+      const home = "/tmp/paperclip-msr-jes421-home";
+      const config = {
+        env: { HOME: { type: "plain", value: home } },
+      };
+      expect(__testing.resolvePiSkillsHome(config)).toBe(
+        path.join(home, ".pi", "agent", "skills"),
+      );
+    });
+
+    it("falls back to os.homedir() for secret_ref bindings and logs at warn", async () => {
+      // Startup-time posture: no secrets service available, so non-plain
+      // bindings can't be resolved here. Documented fail-closed behavior —
+      // log at warn, fall back to server process home. Matches the
+      // platform's overall startup-time access path.
+      const { logger } = await import("../middleware/logger.js");
+      const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => {});
+      const config = {
+        env: {
+          HOME: {
+            type: "secret_ref",
+            secretId: "00000000-0000-0000-0000-000000000001",
+            version: "latest",
+          },
+        },
+      };
+      expect(__testing.resolvePiSkillsHome(config)).toBe(
+        path.join(os.homedir(), ".pi", "agent", "skills"),
+      );
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ envKey: "HOME", bindingType: "secret_ref" }),
+        expect.stringContaining("cannot resolve secret_ref"),
+      );
+      warnSpy.mockRestore();
+    });
+
+    it("re-points a stale link when env.HOME is the persisted plain binding shape", async () => {
+      // The full end-to-end regression: this is the QA repro from
+      // [JES-421](/JES/issues/JES-421) acceptance criterion 2, with the
+      // row constructed in the persisted shape (env bindings as objects).
+      // Pre-fix: scan-and-reconcile returned `{driftedAgents: 0}` because
+      // HOME resolution fell back to the process home. Post-fix: drift is
+      // detected in the agent's actual home and the link is re-pointed.
+      const home = await fs.mkdtemp(
+        path.join(os.tmpdir(), "paperclip-msr-jes421-stale-"),
+      );
+      cleanupDirs.push(home);
+      const skillsHome = path.join(home, ".pi", "agent", "skills");
+      await fs.mkdir(skillsHome, { recursive: true });
+      const oldInstallRoot = path.join(root, "cli", "installs", "oldhash-jes421");
+      const currentInstallRoot = path.join(root, "cli", "installs", "currenthash-jes421");
+      const oldSource = await makeSkillSource(oldInstallRoot, "paperclip");
+      const currentSource = await makeSkillSource(currentInstallRoot, "paperclip");
+      await fs.symlink(oldSource, path.join(skillsHome, "paperclip"));
+
+      const rows: AgentRow[] = [
+        {
+          id: "agent-jes421",
+          companyId: "company-1",
+          adapterType: "pi_local",
+          // Persisted shape: env.HOME is a binding object, not a plain string.
+          adapterConfig: {
+            env: { HOME: { type: "plain", value: home } },
+            paperclipRuntimeSkills: runtimeEntries([
+              {
+                key: "paperclipai/paperclip/paperclip",
+                runtimeName: "paperclip",
+                source: currentSource,
+              },
+            ]),
+          },
+        },
+      ];
+      const summary = await reconcileManagedSkillLinksOnStartup(makeDb(rows));
+      expect(summary.scannedAgents).toBe(1);
+      expect(summary.driftedAgents).toBe(1);
+      expect(summary.resyncedAgents).toBe(1);
+      expect(summary.resyncedAgentIds).toEqual(["agent-jes421"]);
+      expect(summary.failedAgents).toBe(0);
+      // Link re-pointed to the current source in the agent's actual home.
+      expect(
+        path.resolve(skillsHome, await fs.readlink(path.join(skillsHome, "paperclip"))),
+      ).toBe(currentSource);
+    });
+
+    it("groups siblings by home correctly when env.HOME is the persisted plain binding shape", async () => {
+      // The `desiredByHome` per-home union grouping also depends on
+      // `resolvePiSkillsHome`. Pre-fix, the binding HOME caused the
+      // grouping to be empty (all agents grouped under process home), so
+      // union protection for sibling desired skills did not fire. This
+      // test pins the union under persisted-binding input.
+      const home = await fs.mkdtemp(
+        path.join(os.tmpdir(), "paperclip-msr-jes421-union-"),
+      );
+      cleanupDirs.push(home);
+      const skillsHome = path.join(home, ".pi", "agent", "skills");
+      await fs.mkdir(skillsHome, { recursive: true });
+      const oldInstallRoot = path.join(root, "cli", "installs", "oldhash-jes421-union");
+      const currentInstallRoot = path.join(root, "cli", "installs", "currenthash-jes421-union");
+      const oldAlpha = await makeSkillSource(oldInstallRoot, "alpha");
+      const currentAlpha = await makeSkillSource(currentInstallRoot, "alpha");
+      const currentBeta = await makeSkillSource(currentInstallRoot, "beta");
+      await fs.symlink(oldAlpha, path.join(skillsHome, "alpha"));
+      await fs.symlink(currentBeta, path.join(skillsHome, "beta"));
+
+      const rows: AgentRow[] = [
+        {
+          id: "agent-alpha",
+          companyId: "company-1",
+          adapterType: "pi_local",
+          adapterConfig: {
+            env: { HOME: { type: "plain", value: home } },
+            paperclipSkillSync: { desiredSkills: ["paperclipai/paperclip/alpha"] },
+            paperclipRuntimeSkills: runtimeEntries([
+              { key: "paperclipai/paperclip/alpha", runtimeName: "alpha", source: currentAlpha },
+              { key: "paperclipai/paperclip/beta", runtimeName: "beta", source: currentBeta },
+            ]),
+          },
+        },
+        {
+          id: "agent-beta",
+          companyId: "company-1",
+          adapterType: "pi_local",
+          adapterConfig: {
+            env: { HOME: { type: "plain", value: home } },
+            paperclipSkillSync: { desiredSkills: ["paperclipai/paperclip/beta"] },
+            paperclipRuntimeSkills: runtimeEntries([
+              { key: "paperclipai/paperclip/alpha", runtimeName: "alpha", source: currentAlpha },
+              { key: "paperclipai/paperclip/beta", runtimeName: "beta", source: currentBeta },
+            ]),
+          },
+        },
+      ];
+      const summary = await reconcileManagedSkillLinksOnStartup(makeDb(rows));
+      expect(summary.scannedAgents).toBe(2);
+      // First agent detects drift and re-points alpha; second sees no drift
+      // (alpha now current) and skips — union preserved.
+      expect(summary.driftedAgents).toBe(1);
+      expect(summary.resyncedAgents).toBe(1);
+      expect(
+        path.resolve(skillsHome, await fs.readlink(path.join(skillsHome, "alpha"))),
+      ).toBe(currentAlpha);
+      // Beta is preserved verbatim — sibling's desired skill survives.
+      expect(await fs.readlink(path.join(skillsHome, "beta"))).toBe(currentBeta);
+    });
+  });
+
+  it("readEnvBindingAsPlainString classifies bindings correctly", () => {
+    // Plain string → trimmed value.
+    expect(__testing.readEnvBindingAsPlainString("/tmp/x", "HOME")).toBe("/tmp/x");
+    expect(__testing.readEnvBindingAsPlainString("  /tmp/x  ", "HOME")).toBe("/tmp/x");
+    // Plain binding object → trimmed .value.
+    expect(
+      __testing.readEnvBindingAsPlainString(
+        { type: "plain", value: "/tmp/y" },
+        "HOME",
+      ),
+    ).toBe("/tmp/y");
+    expect(
+      __testing.readEnvBindingAsPlainString(
+        { type: "plain", value: "  /tmp/y  " },
+        "HOME",
+      ),
+    ).toBe("/tmp/y");
+    // Non-plain bindings → null (caller logs and falls back).
+    expect(
+      __testing.readEnvBindingAsPlainString(
+        { type: "secret_ref", secretId: "abc" },
+        "HOME",
+      ),
+    ).toBeNull();
+    expect(
+      __testing.readEnvBindingAsPlainString(
+        { type: "user_secret_ref", key: "X" },
+        "HOME",
+      ),
+    ).toBeNull();
+    // Empty / whitespace inputs → null.
+    expect(__testing.readEnvBindingAsPlainString("", "HOME")).toBeNull();
+    expect(__testing.readEnvBindingAsPlainString("   ", "HOME")).toBeNull();
+    expect(
+      __testing.readEnvBindingAsPlainString({ type: "plain", value: "   " }, "HOME"),
+    ).toBeNull();
+    // Malformed inputs → null (defensive).
+    expect(__testing.readEnvBindingAsPlainString(null, "HOME")).toBeNull();
+    expect(__testing.readEnvBindingAsPlainString(undefined, "HOME")).toBeNull();
+    expect(__testing.readEnvBindingAsPlainString(42, "HOME")).toBeNull();
+    expect(
+      __testing.readEnvBindingAsPlainString({ type: "plain" }, "HOME"),
+    ).toBeNull();
+    expect(
+      __testing.readEnvBindingAsPlainString({ type: "plain", value: 42 }, "HOME"),
+    ).toBeNull();
+    expect(
+      __testing.readEnvBindingAsPlainString(["a", "b"], "HOME"),
+    ).toBeNull();
   });
 });

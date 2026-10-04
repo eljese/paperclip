@@ -5,7 +5,9 @@ import type { Db } from "@paperclipai/db";
 import { agents } from "@paperclipai/db";
 import { eq } from "drizzle-orm";
 import {
+  isStalePaperclipManagedSkillLink,
   readInstalledSkillTargets,
+  readPaperclipRuntimeSkillEntries,
   readPaperclipSkillSyncPreference,
 } from "@paperclipai/adapter-utils/server-utils";
 import { syncPiSkills } from "@paperclipai/adapter-pi-local/server";
@@ -30,57 +32,158 @@ function asRecord(value: unknown): Record<string, unknown> {
 
 /**
  * Mirrors `resolvePiSkillsHome` from `@paperclipai/adapter-pi-local/server`
- * exactly. The reconciliation groups agents by skills home so the union of
- * desired skills (passed to `syncPiSkills` as `unionDesiredSkills`) matches
- * the per-home sibling set the explicit POST /agents/:id/skills/sync endpoint
+ * exactly — except for the persisted-binding handling documented below.
+ *
+ * The reconciliation groups agents by skills home so the union of desired
+ * skills (passed to `syncPiSkills` as `unionDesiredSkills`) matches the
+ * per-home sibling set the explicit POST /agents/:id/skills/sync endpoint
  * computes. Centralizing the helper here keeps both paths in lock-step.
+ *
+ * Persisted-binding handling (JES-251 correction #2, addresses the
+ * [JES-421](/JES/issues/JES-421) P1 found by pre-merge QA on PR #23): the
+ * runtime path (manual skills sync) flattens env bindings to plain strings
+ * via `resolveAdapterConfigForRuntime`. The startup path here reads raw
+ * agent rows, where `env.HOME` may be a binding object of the form
+ * `{type:"plain", value:"..."}` (legacy plaintext is also accepted as a
+ * plain string). For plain bindings we extract `.value` directly; for
+ * `secret_ref` / `user_secret_ref` we cannot resolve without the secrets
+ * service, so we log at warn and fall back to the server process home —
+ * which is the documented fail-closed behavior for unrecoverable
+ * bindings and matches the rest of the platform's startup-time access
+ * path (the secrets service isn't yet available to the boot
+ * reconciliation).
  */
 function resolvePiSkillsHome(config: Record<string, unknown>): string {
   const env = asRecord(config.env);
-  const configuredHome =
-    typeof env.HOME === "string" && env.HOME.trim() ? env.HOME.trim() : null;
-  const home = configuredHome ? path.resolve(configuredHome) : os.homedir();
+  const raw = env.HOME;
+  const plain = readEnvBindingAsPlainString(raw, "HOME");
+  const home = plain ? path.resolve(plain) : os.homedir();
   return path.join(home, ".pi", "agent", "skills");
 }
 
 /**
- * Heuristic that catches "silent staleness" without depending on the
- * adapter-utils `readPaperclipRuntimeSkillEntries` resolution path (which
- * looks for bundled skills relative to a moduleDir that varies between dev
- * and build outputs and would either miss in dev or break in installed
- * binaries):
+ * Pre-flatten persisted env bindings in an agent config to plain strings.
+ * Mirrors what `resolveAdapterConfigForRuntime` does for the manual
+ * skills-sync path, but at startup without the secrets service: we can
+ * only resolve `plain` bindings (which carry the value directly). For
+ * `secret_ref` / `user_secret_ref` the value is opaque without the
+ * secrets service, so we leave those bindings untouched — the caller
+ * (adapter's `resolvePiSkillsHome`) will then see the binding object
+ * and fall back to its own home, missing the agent's skills. That's
+ * the documented fail-closed posture and the binding detector already
+ * filtered such agents into the no-drift path.
  *
- *   A symlink in the skills home is a drift candidate when its absolute
- *   target path contains `/installs/` (i.e. it points into a retained
- *   `cli/installs/<hash>/...` install root).
- *
- * Paperclip-managed skill entries are absolute symlinks into the active
- * install dir, so an `/installs/` substring is a reliable signal that the
- * link was created (or last re-pointed) by the Paperclip-managed flow.
- * User-installed skills, demo skills, `.bak-*` directories, and external
- * symlinks are never created with `/installs/` in their target — the user
- * flow writes them into arbitrary paths under the skills home directly.
- *
- * The actual re-point is delegated to `syncPiSkills`, which uses the
- * `isStalePaperclipManagedSkillLink` classifier from PR #18 to decide
- * whether the symlink still matches the current source. Symlinks whose
- * target no longer matches the current source get unlinked; everything else
- * is preserved verbatim.
+ * Returns a shallow-cloned config with a fresh `env` record; non-env
+ * fields are passed through by reference.
  */
-function looksLikeRetainedInstallLink(targetPath: string): boolean {
-  const normalized = targetPath.replace(/\\/g, "/");
-  return (
-    normalized.includes("/installs/") &&
-    (normalized.includes("/skills/") || normalized.includes("/skills-releases/"))
-  );
+function flattenEnvBindingsForRuntimeSync(
+  config: Record<string, unknown>,
+): Record<string, unknown> {
+  const env = asRecord(config.env);
+  const next: Record<string, unknown> = {};
+  let changed = false;
+  for (const [key, raw] of Object.entries(env)) {
+    const plain = readEnvBindingAsPlainStringSilent(raw);
+    if (plain !== null) {
+      next[key] = plain;
+      if (raw !== plain) changed = true;
+    } else {
+      next[key] = raw;
+    }
+  }
+  if (!changed && Object.keys(next).length === Object.keys(env).length) {
+    return config;
+  }
+  return { ...config, env: next };
 }
+
+function readEnvBindingAsPlainStringSilent(raw: unknown): string | null {
+  if (typeof raw === "string") {
+    const trimmed = raw.trim();
+    return trimmed ? trimmed : null;
+  }
+  if (typeof raw === "object" && raw !== null && !Array.isArray(raw)) {
+    const record = raw as Record<string, unknown>;
+    if (record.type === "plain" && typeof record.value === "string") {
+      const trimmed = record.value.trim();
+      return trimmed ? trimmed : null;
+    }
+  }
+  return null;
+}
+
+/**
+ * Read an env binding value as a plain string. Accepts:
+ *   - a plain string (legacy plaintext, backward-compatible);
+ *   - an object `{type:"plain", value:"..."}` (current canonical shape
+ *     written by `normalizeEnvConfig` on every create/update).
+ *
+ * Returns `null` for missing/empty inputs and for binding types whose
+ * resolution requires the secrets service at runtime
+ * (`secret_ref`, `user_secret_ref`). Callers log the gap at warn level
+ * and fall back; this matches the platform's startup-time posture
+ * (no secrets service available to the boot reconciliation).
+ */
+function readEnvBindingAsPlainString(
+  raw: unknown,
+  key: string,
+): string | null {
+  if (typeof raw === "string") {
+    const trimmed = raw.trim();
+    return trimmed ? trimmed : null;
+  }
+  if (typeof raw === "object" && raw !== null && !Array.isArray(raw)) {
+    const record = raw as Record<string, unknown>;
+    if (record.type === "plain" && typeof record.value === "string") {
+      const trimmed = record.value.trim();
+      return trimmed ? trimmed : null;
+    }
+    if (record.type === "secret_ref" || record.type === "user_secret_ref") {
+      logger.warn(
+        { envKey: key, bindingType: record.type },
+        "managed-skill-link reconciliation cannot resolve secret_ref/user_secret_ref env binding at startup; falling back to server home",
+      );
+      return null;
+    }
+  }
+  return null;
+}
+
+/**
+ * Detect drift by comparing each managed link's resolved target with the
+ * current bundled source for that runtime skill. Uses the same
+ * `isStalePaperclipManagedSkillLink` classifier PR #18 ships for
+ * `syncPiSkills`, so the pre-check and the eventual repair agree on the
+ * staleness definition:
+ *
+ *   A symlink is stale iff (a) its basename matches a known runtime
+ *   skill's basename, (b) its target differs from the current source, and
+ *   (c) both the target and the source look like Paperclip-managed skill
+ *   paths (`/skills/`, `/installs/`, or `/skills-releases/`).
+ *
+ * This avoids the prior path-shape heuristic, which misclassified any link
+ * whose target contained `/installs/` + `/skills/` as drift — current
+ * Paperclip-managed links under `cli/installs/<current-hash>/.../skills/...`
+ * were flagged on every startup, triggering a no-op sync that still cost log
+ * noise and (more importantly) stopped the per-home union from short-circuiting
+ * once a sibling agent had already re-pointed a shared-home link.
+ */
 
 /**
  * Detect drift in a pi_local agent's skills home without mutating anything.
  *
- * Returns the list of symlink leaf names whose target lives in a retained
- * install root. The caller passes that list (or the agent's stored desired
- * skills, when set) to `syncPiSkills`, which performs the actual re-point.
+ * Returns the list of symlink leaf names whose target diverges from the
+ * current bundled source for that runtime skill into a retained old install
+ * (using PR #18's `isStalePaperclipManagedSkillLink` classifier). The caller
+ * passes that list (or the agent's stored desired skills, when set) to
+ * `syncPiSkills`, which performs the actual re-point.
+ *
+ * Symlinks whose target already matches the current source exactly are NOT
+ * reported as drift — `isStalePaperclipManagedSkillLink` short-circuits on
+ * equality. This is the key invariant: once any sibling agent's startup
+ * sync has re-pointed a shared-home link at the current source, subsequent
+ * sibling detections see no drift and skip their sync entirely, preserving
+ * the union without redundant re-passes.
  */
 async function detectPiSkillsHomeDrift(config: Record<string, unknown>): Promise<{
   drifted: boolean;
@@ -96,12 +199,30 @@ async function detectPiSkillsHomeDrift(config: Record<string, unknown>): Promise
     return { drifted: false, driftedNames: [], skillsHome };
   }
 
+  let availableEntries: Awaited<ReturnType<typeof readPaperclipRuntimeSkillEntries>>;
+  try {
+    availableEntries = await readPaperclipRuntimeSkillEntries(config, __moduleDir);
+  } catch {
+    return { drifted: false, driftedNames: [], skillsHome };
+  }
+
+  // Map runtime leaf name → current bundled source. Symlinks whose leaf
+  // name isn't in this map are not Paperclip-managed (user-installed,
+  // demo, .bak-*, etc.) and are never classified as drift.
+  const sourceByName = new Map<string, string>();
+  for (const entry of availableEntries) {
+    if (!entry.runtimeName || !entry.source) continue;
+    sourceByName.set(entry.runtimeName, entry.source);
+  }
+
   const driftedNames: string[] = [];
   for (const [name, entry] of targets.entries()) {
     if (entry.kind !== "symlink") continue;
     const targetPath = entry.targetPath;
     if (!targetPath) continue;
-    if (looksLikeRetainedInstallLink(targetPath)) {
+    const currentSource = sourceByName.get(name);
+    if (!currentSource) continue;
+    if (isStalePaperclipManagedSkillLink(targetPath, currentSource)) {
       driftedNames.push(name);
     }
   }
@@ -207,11 +328,22 @@ export async function reconcileManagedSkillLinksOnStartup(
     for (const key of effectiveDesired) unionSet.add(key);
     const unionDesiredSkills = Array.from(unionSet);
 
+    // Pre-flatten persisted env bindings to plain strings before handing
+    // the config to `syncPiSkills`. The pi_local adapter's internal
+    // `resolvePiSkillsHome` (PR #18) only reads plain-string `env.HOME`,
+    // so without this pre-flatten the sync would scan the wrong home
+    // and never reach the agent's actual managed-skill directory.
+    // For plain bindings we extract `.value`; for non-plain bindings we
+    // cannot resolve at startup (no secrets service) — the detector
+    // already filtered those into the no-drift path, so we should not
+    // reach here with a non-plain HOME. Defensive fallback: leave env
+    // as-is and let the adapter fall back to its own home (which will
+    // miss the agent's links; logged at warn above).
     const ctx = {
       agentId: row.id,
       companyId: row.companyId,
       adapterType: row.adapterType as "pi_local",
-      config: adapterConfig,
+      config: flattenEnvBindingsForRuntimeSync(adapterConfig),
     };
 
     try {
@@ -252,6 +384,8 @@ export async function reconcileManagedSkillLinksOnStartup(
 export const __testing = {
   resolvePiSkillsHome,
   detectPiSkillsHomeDrift,
-  looksLikeRetainedInstallLink,
+  readEnvBindingAsPlainString,
+  readEnvBindingAsPlainStringSilent,
+  flattenEnvBindingsForRuntimeSync,
   asRecord,
 };
