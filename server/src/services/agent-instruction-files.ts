@@ -171,8 +171,22 @@ const stat=(name)=>{try{return fs.lstatSync(name)}catch(e){if(e.code==='ENOENT')
 const directory=stat(root);
 if(directory && (directory.isSymbolicLink() || !directory.isDirectory()))throw Error('Unsafe runtime exclusion directory');
 if(!directory)fs.mkdirSync(root,{mode:0o700});
-const existing=stat(filename);
-if(existing && (existing.isSymbolicLink() || !existing.isFile()))throw Error('Unsafe runtime exclusion file');
+const ensureExistingIsSafe=()=>{
+ const before=stat(filename);
+ if(!before)return false;
+ if(before.isSymbolicLink() || !before.isFile())throw Error('Unsafe runtime exclusion file');
+ const fd=fs.openSync(filename,fs.constants.O_RDONLY|(fs.constants.O_NOFOLLOW||0));
+ try{
+  const opened=fs.fstatSync(fd),current=stat(filename);
+  if(!opened.isFile() || opened.nlink!==1 || !current || current.isSymbolicLink() || current.dev!==opened.dev || current.ino!==opened.ino)throw Error('Unsafe runtime exclusion file');
+  if(fs.readFileSync(fd,'utf8')!=='*\n')throw Error('Runtime exclusion file already exists; refusing to replace project-owned contents');
+  return true;
+ }finally{fs.closeSync(fd)}
+};
+if(ensureExistingIsSafe())process.exit(0);
 const temporary=path.join(root,'.ignore-'+crypto.randomUUID()+'.tmp');
-try{fs.writeFileSync(temporary,'*\n',{flag:'wx',mode:0o600});fs.renameSync(temporary,filename)}finally{fs.rmSync(temporary,{force:true})}
+try{
+ fs.writeFileSync(temporary,'*\n',{flag:'wx',mode:0o600});
+ try{fs.linkSync(temporary,filename)}catch(error){if(error.code!=='EEXIST' || !ensureExistingIsSafe())throw error}
+}finally{fs.rmSync(temporary,{force:true})}
 `;
