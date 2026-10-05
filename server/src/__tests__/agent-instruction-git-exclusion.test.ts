@@ -33,6 +33,24 @@ it("excludes runtime files without changing tracked ignore rules or Git metadata
   expect(await fs.readFile(metadata, "utf8")).toBe(before);
 });
 
+it("fails visibly without replacing a tracked project-owned runtime ignore file", async () => {
+  await git(root, "init");
+  await git(root, "config", "user.name", "Test");
+  await git(root, "config", "user.email", "test@example.test");
+  const runtime = path.join(root, ".paperclip-runtime");
+  await fs.mkdir(runtime);
+  const ignore = path.join(runtime, ".gitignore");
+  const projectRules = "# project-owned rules\nkeep-this-pattern\n";
+  await fs.writeFile(ignore, projectRules);
+  await git(root, "add", ".paperclip-runtime/.gitignore");
+  await git(root, "commit", "-m", "track project runtime ignore rules");
+
+  await expect(exclude(root)).rejects.toThrow("refusing to replace project-owned contents");
+  expect(await fs.readFile(ignore, "utf8")).toBe(projectRules);
+  expect((await git(root, "show", "HEAD:.paperclip-runtime/.gitignore")).stdout).toBe(projectRules);
+  expect((await git(root, "status", "--short")).stdout).toBe("");
+});
+
 it("never writes to an external gitdir selected by task-controlled metadata", async () => {
   const workspace = path.join(root, "workspace"), outside = path.join(root, "outside.git");
   await fs.mkdir(workspace);
@@ -75,13 +93,13 @@ it.each(["directory", "file"])("rejects a symlink at the runtime exclusion %s", 
   expect(await fs.readFile(externalFile, "utf8")).toBe("untouched\n");
 });
 
-it("replaces a linked ignore file without writing through its external inode", async () => {
+it("rejects a hard-linked ignore file without changing either link", async () => {
   const externalFile = path.join(root, "outside-ignore"), workspace = path.join(root, "workspace");
   const runtime = path.join(workspace, ".paperclip-runtime");
   await fs.mkdir(runtime, { recursive: true });
   await fs.writeFile(externalFile, "untouched\n");
   await fs.link(externalFile, path.join(runtime, ".gitignore"));
-  await exclude(workspace);
+  await expect(exclude(workspace)).rejects.toThrow("Unsafe runtime exclusion file");
   expect(await fs.readFile(externalFile, "utf8")).toBe("untouched\n");
-  expect(await fs.readFile(path.join(runtime, ".gitignore"), "utf8")).toBe("*\n");
+  expect(await fs.readFile(path.join(runtime, ".gitignore"), "utf8")).toBe("untouched\n");
 });
