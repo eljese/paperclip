@@ -1,3 +1,5 @@
+import { HOST_OOM_RETRY_REASON } from "./host-oom.js";
+
 type RetryRun = {
   scheduledRetryAttempt?: number | null;
   scheduledRetryReason?: string | null;
@@ -36,13 +38,17 @@ function historicalFailureCount(run: RetryRun): number {
     const saved = count(run.contextSnapshot?.failureRetriesBeforeWorkspaceWait);
     if (saved !== null) return saved;
   }
+  if (run.scheduledRetryReason === HOST_OOM_RETRY_REASON) {
+    const saved = count(run.contextSnapshot?.failureRetriesBeforeHostOomWait);
+    if (saved !== null) return saved;
+  }
   // Historical ambiguous counters remain conservative rather than resetting.
   return count(run.scheduledRetryAttempt) ?? 0;
 }
 
 export function executionRetryAccounting(run: RetryRun): ExecutionRetryAccounting {
   const saved = savedAccounting(run);
-  const nonFailureLane = ["max_turns_continuation", "issue_disposition_repair", "workspace_busy", "ai_connection_busy"].includes(run.scheduledRetryReason ?? "");
+  const nonFailureLane = ["max_turns_continuation", "issue_disposition_repair", "workspace_busy", "ai_connection_busy", HOST_OOM_RETRY_REASON].includes(run.scheduledRetryReason ?? "");
   return {
     version: 1,
     failureRetries: Math.max(saved?.failureRetries ?? 0, saved && nonFailureLane ? 0 : historicalFailureCount(run)),
@@ -57,7 +63,7 @@ export function executionFailureRetryCount(run: RetryRun): number {
 }
 
 export function executionRetryAttemptCount(run: RetryRun, reason: string): number {
-  if (reason === "workspace_busy" || reason === "ai_connection_busy") {
+  if (reason === "workspace_busy" || reason === "ai_connection_busy" || reason === HOST_OOM_RETRY_REASON) {
     return run.scheduledRetryReason === reason ? count(run.scheduledRetryAttempt) ?? 0 : 0;
   }
   const accounting = executionRetryAccounting(run);
@@ -67,6 +73,6 @@ export function executionRetryAttemptCount(run: RetryRun, reason: string): numbe
 export function accountingForScheduledRetry(run: RetryRun, reason: string, attempt: number): ExecutionRetryAccounting {
   const accounting = executionRetryAccounting(run);
   if (reason === "max_turns_continuation") accounting.maxTurnContinuations = attempt;
-  else if (reason !== "workspace_busy" && reason !== "ai_connection_busy") accounting.failureRetries = attempt;
+  else if (reason !== "workspace_busy" && reason !== "ai_connection_busy" && reason !== HOST_OOM_RETRY_REASON) accounting.failureRetries = attempt;
   return accounting;
 }
