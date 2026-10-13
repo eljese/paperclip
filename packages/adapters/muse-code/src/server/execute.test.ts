@@ -401,6 +401,31 @@ describe("Muse Code external adapter", () => {
     expect(processMock).not.toHaveBeenCalled();
   });
 
+  it("fails closed when run scratch is inside the task repository", async () => {
+    const { fetchImpl, calls } = makeFetch();
+    const repositoryRoot = path.join(tempRoot, "repository");
+    const repositoryWorkspace = path.join(repositoryRoot, "workspace");
+    const repositoryScratch = path.join(repositoryRoot, "paperclip-run-muse-repository");
+    await fs.mkdir(path.join(repositoryRoot, ".git"), { recursive: true, mode: 0o700 });
+    await fs.writeFile(path.join(repositoryRoot, ".git", "HEAD"), "ref: refs/heads/main\n", { mode: 0o600 });
+    await fs.mkdir(repositoryWorkspace, { recursive: true, mode: 0o700 });
+    await fs.mkdir(repositoryScratch, { mode: 0o700 });
+    await fs.writeFile(
+      path.join(repositoryScratch, ".paperclip-run-scratch.json"),
+      JSON.stringify({ version: 1, companyId: "company-1", agentId: "agent-1", runId: "run-muse-1" }),
+      { mode: 0o600 },
+    );
+    const ctx = makeContext();
+    ctx.config.cwd = repositoryWorkspace;
+    ctx.context.paperclipScratch.dir = repositoryScratch;
+    const processMock = vi.fn();
+    const execute = createMuseCodeExecutor({ fetchImpl: fetchImpl as any, runChildProcessImpl: processMock as any });
+
+    await expect(execute(ctx)).rejects.toThrow(/scratch|workspace/i);
+    expect(calls).toHaveLength(0);
+    expect(processMock).not.toHaveBeenCalled();
+  });
+
   it("fails closed when the private scratch root is inside the task workspace", async () => {
     const { fetchImpl } = makeFetch();
     const processMock = vi.fn();
