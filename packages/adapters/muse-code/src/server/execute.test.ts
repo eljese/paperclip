@@ -250,6 +250,54 @@ describe("Muse Code external adapter", () => {
     expect(result.summary).toBe(`Muse Code completed the assigned task with ${model}.`);
   });
 
+  it("skips missing advisory workspaces while still validating run scratch", async () => {
+    const { fetchImpl } = makeFetch();
+    const processMock = vi.fn();
+    successfulProcess(processMock);
+    const ctx = makeContext();
+    ctx.context.paperclipWorkspaces = [{ cwd: path.join(tempRoot, "missing-advisory-workspace") }];
+    const execute = createMuseCodeExecutor({ fetchImpl: fetchImpl as any, runChildProcessImpl: processMock as any });
+
+    const result = await execute(ctx);
+
+    expect(result.exitCode).toBe(0);
+    expect(processMock).toHaveBeenCalledOnce();
+    expect(processMock.mock.calls[0]![3].env.TMPDIR).toBe(runScratch);
+
+    await fs.writeFile(
+      path.join(runScratch, ".paperclip-run-scratch.json"),
+      JSON.stringify({ version: 1, companyId: "company-1", agentId: "other-agent", runId: "run-muse-1" }),
+      { mode: 0o600 },
+    );
+    const secondProcessMock = vi.fn();
+    const secondExecute = createMuseCodeExecutor({ fetchImpl: makeFetch().fetchImpl as any, runChildProcessImpl: secondProcessMock as any });
+
+    await expect(secondExecute(ctx)).rejects.toThrow(/ownership/i);
+    expect(secondProcessMock).not.toHaveBeenCalled();
+  });
+
+  it("fails closed on non-ENOENT advisory workspace errors", async () => {
+    const deniedWorkspace = path.join(tempRoot, "permission-denied-advisory-workspace");
+    const originalRealpath = fs.realpath.bind(fs);
+    const realpathSpy = vi.spyOn(fs, "realpath").mockImplementation(async (pathValue: any) => {
+      if (String(pathValue) === deniedWorkspace) {
+        throw Object.assign(new Error("permission denied"), { code: "EACCES" });
+      }
+      return originalRealpath(pathValue);
+    });
+    try {
+      const ctx = makeContext();
+      ctx.context.paperclipWorkspaces = [{ cwd: deniedWorkspace }];
+      const processMock = vi.fn();
+      const execute = createMuseCodeExecutor({ fetchImpl: makeFetch().fetchImpl as any, runChildProcessImpl: processMock as any });
+
+      await expect(execute(ctx)).rejects.toMatchObject({ code: "EACCES" });
+      expect(processMock).not.toHaveBeenCalled();
+    } finally {
+      realpathSpy.mockRestore();
+    }
+  });
+
   it.each([
     { field: "executorProvider", value: "pi" },
     { field: "quotaProvider", value: "meta-api" },

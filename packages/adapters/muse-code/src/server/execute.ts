@@ -141,7 +141,13 @@ async function workspaceAndRepositoryRoots(ctx: AdapterExecutionContext, workspa
   for (const hintValue of hints) {
     const hint = parseObject(hintValue);
     const cwd = stringValue(hint.cwd);
-    if (cwd && path.isAbsolute(cwd)) roots.add(await fs.realpath(cwd));
+    if (cwd && path.isAbsolute(cwd)) {
+      try {
+        roots.add(await fs.realpath(cwd));
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+    }
   }
 
   const repositories = new Set<string>();
