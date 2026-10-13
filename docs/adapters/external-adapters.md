@@ -280,7 +280,7 @@ Check levels:
 # Settings → Adapters → Install from npm → "my-paperclip-adapter"
 
 # Or via API
-curl -X POST http://localhost:3102/api/adapters \
+curl -X POST http://localhost:3102/api/adapters/install \
   -H "Authorization: Bearer <token>" \
   -H "Content-Type: application/json" \
   -d '{"packageName": "my-paperclip-adapter"}'
@@ -289,10 +289,10 @@ curl -X POST http://localhost:3102/api/adapters \
 ### From local directory
 
 ```sh
-curl -X POST http://localhost:3102/api/adapters \
+curl -X POST http://localhost:3102/api/adapters/install \
   -H "Authorization: Bearer <token>" \
   -H "Content-Type: application/json" \
-  -d '{"localPath": "/home/user/my-adapter"}'
+  -d '{"packageName": "/home/user/my-adapter", "isLocalPath": true}'
 ```
 
 Local adapters are symlinked into Paperclip's adapter directory. Changes to the source are picked up on server restart.
@@ -400,6 +400,14 @@ Other Paperclip users can then install your adapter by package name from the UI 
 - Configure network access controls if the runtime supports them
 - Always enforce timeout and grace period — don't let agents run forever
 - The UI parser module runs in a browser sandbox — it must have zero runtime imports and no side effects
+
+## Example: Muse Code
+
+The Paperclip repository includes an external adapter package for local Muse Code
+execution. It uses the plan-quota-dash selection and reservation API, preserves
+manual-only policy, and passes task context through a short-lived private prompt
+file. See [`packages/adapters/muse-code/README.md`](../../packages/adapters/muse-code/README.md)
+for its execution, privacy, installation, and test contract.
 
 ## Next Steps
 
