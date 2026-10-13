@@ -535,8 +535,11 @@ export function createMuseCodeExecutor(dependencies: MuseCodeExecutorDependencie
           onLog: async () => {},
           onSpawn: async (meta) => {
             processStarted = true;
-            await ctx.onSpawn?.(meta);
-            if (ctx.signal?.aborted || cancellationRequested) cancelRunningProcess();
+            try {
+              await ctx.onSpawn?.(meta);
+            } finally {
+              if (ctx.signal?.aborted || cancellationRequested) cancelRunningProcess();
+            }
           },
         });
         durationMs = Math.max(0, Math.round(now() - startedAt));
@@ -638,7 +641,7 @@ export function createMuseCodeExecutor(dependencies: MuseCodeExecutorDependencie
           await ctx.onLog("stderr", "[muse-code] quota event report failed.\n").catch(() => undefined);
         }
       }
-      const status = result ? String(parseObject(result.resultJson).status) : thrownError ? "failed" : "failed";
+      const status = result ? String(parseObject(result.resultJson).status) : "failed";
       const logExit = exitCode === null ? "null" : String(exitCode);
       await ctx.onLog("stdout", `[muse-code] status=${status} exitCode=${logExit} durationMs=${durationMs}\n`).catch(() => undefined);
     }

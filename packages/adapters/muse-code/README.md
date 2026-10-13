@@ -53,6 +53,10 @@ add a pay-as-you-go fallback.
 
 Optional adapter settings are an instruction template, an execution timeout
 (default 900 seconds), and a cancellation grace period (default 15 seconds).
+Keep `timeoutSec` below about 60 minutes. The adapter intentionally withholds
+child output during a run, so the host's silent-run watchdog can classify a run
+with no output for 60 minutes as suspicious and may create recovery work. The
+default timeout stays well below that threshold.
 
 ## Context, logging, and safety
 

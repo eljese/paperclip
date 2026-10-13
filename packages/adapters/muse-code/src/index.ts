@@ -1,3 +1,4 @@
+import path from "node:path";
 import type {
   AdapterEnvironmentCheck,
   AdapterEnvironmentTestContext,
@@ -96,7 +97,7 @@ export async function testEnvironment(
       message: "Muse Code adapter supports local execution targets only.",
     });
   }
-  if (!cwd || !cwd.startsWith("/")) {
+  if (!cwd || !path.isAbsolute(cwd)) {
     checks.push({
       code: "invalid_cwd",
       level: "error",

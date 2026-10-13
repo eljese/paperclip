@@ -423,6 +423,58 @@ describe("Muse Code external adapter", () => {
     expect(calls.some((call) => call.url.endsWith("/v1/reservations/reservation-1"))).toBe(true);
   });
 
+  it("terminates the child when a cancellation races a rejected host onSpawn hook", async () => {
+    const { fetchImpl, calls } = makeFetch();
+    const controller = new AbortController();
+    const signals: string[] = [];
+    const processMock = vi.fn(async (runId: string, _command: string, _args: string[], processOptions: any) => {
+      const child = {
+        pid: 1234,
+        exitCode: null as number | null,
+        signalCode: null as NodeJS.Signals | null,
+        kill: (_signal: NodeJS.Signals) => true,
+      };
+      let resolveDone!: (value: unknown) => void;
+      const done = new Promise((resolve) => { resolveDone = resolve; });
+      child.kill = ((signal: NodeJS.Signals) => {
+        signals.push(signal);
+        child.signalCode = signal;
+        resolveDone({ exitCode: null, signal, timedOut: false, stdout: RAW_OUTPUT, stderr: RAW_OUTPUT, pid: child.pid, startedAt: new Date(0).toISOString() });
+        return true;
+      }) as typeof child.kill;
+      // Mirror runChildProcess ordering: the host hook runs before the child is
+      // registered, and this host hook aborts the run and then rejects.
+      const spawnHook = processOptions.onSpawn?.({ pid: child.pid, processGroupId: null, startedAt: new Date(0).toISOString() });
+      runningProcesses.set(runId, { child, processGroupId: null, graceSec: 1 } as any);
+      await spawnHook?.catch(() => undefined);
+      return await Promise.race([
+        done,
+        new Promise((resolve) => setTimeout(
+          () => resolve({ exitCode: 0, signal: null, timedOut: false, stdout: RAW_OUTPUT, stderr: RAW_OUTPUT, pid: child.pid, startedAt: new Date(0).toISOString() }),
+          500,
+        ).unref?.()),
+      ]);
+    });
+    const execute = createMuseCodeExecutor({ fetchImpl: fetchImpl as any, runChildProcessImpl: processMock as any });
+    const ctx = makeContext({
+      signal: controller.signal,
+      onSpawn: vi.fn(async () => {
+        controller.abort();
+        throw new Error("host onSpawn hook failed");
+      }),
+    });
+
+    const result = await execute(ctx);
+
+    expect(signals).toContain("SIGTERM");
+    expect(result.errorMessage).toMatch(/cancel/i);
+    expect(JSON.stringify(result)).not.toContain(ISSUE_TEXT);
+    expect(JSON.stringify(result)).not.toContain(RAW_OUTPUT);
+    const event = calls.find((call) => call.url.endsWith("/v1/events"))!;
+    expect(JSON.parse(String(event.init.body))).toMatchObject({ result: "provider_error", quotaProvider: "meta-muse", quotaPool: "meta-muse-code" });
+    expect(calls.some((call) => call.url.endsWith("/v1/reservations/reservation-1"))).toBe(true);
+  });
+
   it("fails closed when Paperclip run scratch is not mode 0700", async () => {
     const { fetchImpl, calls } = makeFetch();
     await fs.chmod(runScratch, 0o755);
