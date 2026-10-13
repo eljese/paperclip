@@ -18,6 +18,13 @@ test("release package manifest covers all public packages with explicit CI enrol
   assert.ok(packages.every((pkg) => typeof pkg.publishFromCi === "boolean"));
 });
 
+test("Muse Code is listed in the release map without CI publishing", () => {
+  const museCode = buildReleasePackagePlan().find((pkg) => pkg.name === "@paperclipai/adapter-muse-code");
+
+  assert.equal(museCode?.dir, "packages/adapters/muse-code");
+  assert.equal(museCode?.publishFromCi, false);
+});
+
 test("release package list only contains CI-enrolled packages", () => {
   const enabledPackages = getReleasePackages();
   assert.ok(enabledPackages.length > 0);

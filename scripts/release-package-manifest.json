@@ -50,6 +50,11 @@
     "publishFromCi": true
   },
   {
+    "dir": "packages/adapters/muse-code",
+    "name": "@paperclipai/adapter-muse-code",
+    "publishFromCi": false
+  },
+  {
     "dir": "packages/adapters/opencode-local",
     "name": "@paperclipai/adapter-opencode-local",
     "publishFromCi": true

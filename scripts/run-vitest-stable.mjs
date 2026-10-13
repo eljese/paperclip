@@ -24,6 +24,7 @@ const nonServerProjects = [
   "@paperclipai/skills-catalog",
   "@paperclipai/db",
   "@paperclipai/adapter-utils",
+  "@paperclipai/adapter-muse-code",
   "@paperclipai/adapter-claude-local",
   "@paperclipai/adapter-codex-local",
   "@paperclipai/adapter-grok-local",
