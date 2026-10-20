@@ -59,7 +59,7 @@ function esbuildFixture(t) {
   return { directory, graph, esbuild, producerBinary, publish, writePackage };
 }
 const codexTargets = ["linux-x64", "linux-arm64", "darwin-x64", "darwin-arm64", "win32-x64", "win32-arm64"];
-const codexOptional = Object.fromEntries(codexTargets.map(target => [`@openai/codex-${target}`, `npm:@openai/codex@0.156.1-${target}`]));
+const codexOptional = Object.fromEntries(codexTargets.map(target => [`@openai/codex-${target}`, `npm:@openai/codex@0.160.0-${target}`]));
 const claudeTargets = [...codexTargets, "linux-x64-musl", "linux-arm64-musl"];
 const claudeOptional = Object.fromEntries(claudeTargets.map(target => [`@anthropic-ai/claude-agent-sdk-${target}`, "0.3.286"]));
 function claudeFixture(t) {
@@ -94,14 +94,14 @@ function codexFixture(t) {
   const writePackage = (location, metadata) => {
     mkdirSync(location, { recursive: true }); writeFileSync(join(location, "package.json"), JSON.stringify(metadata)); return location;
   };
-  const bridge = writePackage(join(graph, "@agentclientprotocol/codex-acp"), { name: "@agentclientprotocol/codex-acp", version: "1.13.1", dependencies: { "@openai/codex": "0.156.1" } });
+  const bridge = writePackage(join(graph, "@agentclientprotocol/codex-acp"), { name: "@agentclientprotocol/codex-acp", version: "1.13.1", dependencies: { "@openai/codex": "0.160.0" } });
   writeFileSync(join(bridge, "index.js"), "export {};\n");
-  const runtime = writePackage(join(graph, "@openai/codex"), { name: "@openai/codex", version: "0.156.1", bin: { codex: "bin/codex.js" }, optionalDependencies: codexOptional });
+  const runtime = writePackage(join(graph, "@openai/codex"), { name: "@openai/codex", version: "0.160.0", bin: { codex: "bin/codex.js" }, optionalDependencies: codexOptional });
   mkdirSync(join(runtime, "bin")); writeFileSync(join(runtime, "bin/codex.js"), "// official JavaScript fixture, never executed\n");
   mkdirSync(join(runtime, "vendor")); writeFileSync(join(runtime, "vendor/codex"), "producer fallback binary fixture, never executed");
-  const producer = writePackage(join(graph, "@openai/codex-linux-x64"), { name: "@openai/codex", version: "0.156.1-linux-x64", os: ["linux"], cpu: ["x64"] });
+  const producer = writePackage(join(graph, "@openai/codex-linux-x64"), { name: "@openai/codex", version: "0.160.0-linux-x64", os: ["linux"], cpu: ["x64"] });
   mkdirSync(join(producer, "vendor")); writeFileSync(join(producer, "vendor/codex"), "producer optional binary fixture, never executed");
-  const nested = writePackage(join(bridge, "node_modules/@openai/codex-darwin-arm64"), { name: "@openai/codex", version: "0.156.1-darwin-arm64", os: ["darwin"], cpu: ["arm64"] });
+  const nested = writePackage(join(bridge, "node_modules/@openai/codex-darwin-arm64"), { name: "@openai/codex", version: "0.160.0-darwin-arm64", os: ["darwin"], cpu: ["arm64"] });
   writePackage(join(graph, "unrelated-linux-x64"), { name: "unrelated-linux-x64", version: "1.0.0" });
   const profiles = [{ agent: "codex", ...profileData.profiles.codex }];
   const publish = { name: "paperclip-codex-pack-fixture", version: "1.0.0", dependencies: { "@agentclientprotocol/codex-acp": "1.13.1" }, bundleDependencies: ["@agentclientprotocol/codex-acp"] };
@@ -242,7 +242,7 @@ test("published Codex bridge uses its qualified producer closure without consume
   assert.equal(published.overrides, undefined);
   assert.equal(installManifest.overrides.rollup, undefined);
   const bad = structuredClone(rootPackage);
-  bad.pnpm.overrides["@agentclientprotocol/codex-acp@1.13.1>@openai/codex"] = "0.160.0";
+  bad.pnpm.overrides["@agentclientprotocol/codex-acp@1.13.1>@openai/codex"] = "0.156.1";
   assert.throws(() => configureBundledProviderOverrides(installManifest, serverPackage.bundleDependencies, bad, profileData), /runtime override must match/);
   const unpinned = createBundledInstallManifest(published, serverPackage.bundleDependencies);
   unpinned.dependencies["@agentclientprotocol/codex-acp"] = "^1.13.1";
@@ -335,7 +335,7 @@ test("Codex bundles retain pinned JavaScript and delegate official consumer plat
 test("Codex bundle validation fails before deleting producer binaries for altered pins or optional declarations", (t) => {
   const { directory, runtime, producer, profiles, publish } = codexFixture(t);
   const file = join(runtime, "package.json"), original = JSON.parse(readFileSync(file, "utf8"));
-  writeFileSync(file, JSON.stringify({ ...original, version: "0.160.0" }));
+  writeFileSync(file, JSON.stringify({ ...original, version: "0.156.1" }));
   assert.throws(() => stageBundledProviderOptionalDependencies(directory, publish, profiles), /runtime version mismatch/);
   writeFileSync(file, JSON.stringify({ ...original, optionalDependencies: { ...codexOptional, "@openai/codex-untrusted": "0.160.0" } }));
   assert.throws(() => stageBundledProviderOptionalDependencies(directory, publish, profiles), /not qualified/);
@@ -346,7 +346,7 @@ test("Codex bundle validation fails before deleting producer binaries for altere
     "Missing wrapper declarations require the exact published-root delegation mapping");
   writeFileSync(file, JSON.stringify(original));
   assert.throws(() => stageBundledProviderOptionalDependencies(directory, { ...publish,
-    optionalDependencies: { "@openai/codex-darwin-arm64": "npm:@openai/codex@0.160.0-darwin-arm64" } }, profiles), /conflicts with published/);
+    optionalDependencies: { "@openai/codex-darwin-arm64": "npm:@openai/codex@0.156.1-darwin-arm64" } }, profiles), /conflicts with published/);
   assert.equal(existsSync(producer), true);
   assert.equal(readFileSync(file, "utf8"), JSON.stringify(original), "Conflicting root declarations must not normalize metadata");
 });
@@ -700,7 +700,7 @@ test("server package staging applies every bundled runtime patch and preserves t
   mkdirSync(fixtureArtifacts);
   const nativePackage = join(fixtureArtifacts, "@openai/codex-linux-x64");
   mkdirSync(join(nativePackage, "vendor"), { recursive: true });
-  writeFileSync(join(nativePackage, "package.json"), JSON.stringify({ name: "@openai/codex", version: "0.156.1-linux-x64", os: ["linux"], cpu: ["x64"] }));
+  writeFileSync(join(nativePackage, "package.json"), JSON.stringify({ name: "@openai/codex", version: "0.160.0-linux-x64", os: ["linux"], cpu: ["x64"] }));
   writeFileSync(join(nativePackage, "vendor/codex"), "producer host fixture; never executed");
   mkdirSync(join(fixtureSourceRoot, "packages/paperclip-runner/src/drivers/acpx"), { recursive: true });
   writeFileSync(join(fixtureSourceRoot, "package.json"), JSON.stringify(rootPackage));
@@ -873,7 +873,7 @@ printf '{"name":"@agentclientprotocol/codex-acp","version":"1.13.1"}\\n' > "$dir
 printf 'stock runtime without the hook\\n' > "$dir/dist/index.js"
 rdir="node_modules/@openai/codex"
 mkdir -p "$rdir"
-printf '{"name":"@openai/codex","version":"0.156.1","optionalDependencies":{"@openai/codex-linux-x64":"npm:@openai/codex@0.156.1-linux-x64","@openai/codex-linux-arm64":"npm:@openai/codex@0.156.1-linux-arm64","@openai/codex-darwin-x64":"npm:@openai/codex@0.156.1-darwin-x64","@openai/codex-darwin-arm64":"npm:@openai/codex@0.156.1-darwin-arm64","@openai/codex-win32-x64":"npm:@openai/codex@0.156.1-win32-x64","@openai/codex-win32-arm64":"npm:@openai/codex@0.156.1-win32-arm64"}}\\n' > "$rdir/package.json"
+printf '{"name":"@openai/codex","version":"0.160.0","optionalDependencies":{"@openai/codex-linux-x64":"npm:@openai/codex@0.160.0-linux-x64","@openai/codex-linux-arm64":"npm:@openai/codex@0.160.0-linux-arm64","@openai/codex-darwin-x64":"npm:@openai/codex@0.160.0-darwin-x64","@openai/codex-darwin-arm64":"npm:@openai/codex@0.160.0-darwin-arm64","@openai/codex-win32-x64":"npm:@openai/codex@0.160.0-win32-x64","@openai/codex-win32-arm64":"npm:@openai/codex@0.160.0-win32-arm64"}}\\n' > "$rdir/package.json"
 `,
   );
   writeExecutable(
@@ -954,7 +954,7 @@ printf '{"name":"@agentclientprotocol/codex-acp","version":"1.13.1"}\\n' > "$dir
 printf 'stock runtime without the hook\\n' > "$dir/dist/index.js"
 rdir="node_modules/@openai/codex"
 mkdir -p "$rdir"
-printf '{"name":"@openai/codex","version":"0.156.1","optionalDependencies":{"@openai/codex-linux-x64":"npm:@openai/codex@0.156.1-linux-x64","@openai/codex-linux-arm64":"npm:@openai/codex@0.156.1-linux-arm64","@openai/codex-darwin-x64":"npm:@openai/codex@0.156.1-darwin-x64","@openai/codex-darwin-arm64":"npm:@openai/codex@0.156.1-darwin-arm64","@openai/codex-win32-x64":"npm:@openai/codex@0.156.1-win32-x64","@openai/codex-win32-arm64":"npm:@openai/codex@0.156.1-win32-arm64"}}\\n' > "$rdir/package.json"
+printf '{"name":"@openai/codex","version":"0.160.0","optionalDependencies":{"@openai/codex-linux-x64":"npm:@openai/codex@0.160.0-linux-x64","@openai/codex-linux-arm64":"npm:@openai/codex@0.160.0-linux-arm64","@openai/codex-darwin-x64":"npm:@openai/codex@0.160.0-darwin-x64","@openai/codex-darwin-arm64":"npm:@openai/codex@0.160.0-darwin-arm64","@openai/codex-win32-x64":"npm:@openai/codex@0.160.0-win32-x64","@openai/codex-win32-arm64":"npm:@openai/codex@0.160.0-win32-arm64"}}\\n' > "$rdir/package.json"
 `,
   );
   // A patch binary that silently leaves stock code behind must still fail the release.

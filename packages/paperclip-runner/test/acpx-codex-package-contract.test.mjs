@@ -48,11 +48,11 @@ const nativeSessionExecutor = await readFile(
 );
 
 test("the runner pins every qualified ACPX production dependency", () => {
-  assert.equal(runnerPackage.dependencies["@openai/codex"], "0.156.1");
+  assert.equal(runnerPackage.dependencies["@openai/codex"], "0.160.0");
   assert.equal(runnerPackage.dependencies["@anthropic-ai/claude-agent-sdk"], undefined);
   // codex-acp 1.13.1's nested @openai/codex is pinned to the exact qualified
-  // 0.156.1 runtime (bundled-provider gate requires the override entry).
-  assert.equal(rootPackage.pnpm.overrides["@agentclientprotocol/codex-acp@1.13.1>@openai/codex"], "0.156.1");
+  // 0.160.0 runtime (bundled-provider gate requires the override entry).
+  assert.equal(rootPackage.pnpm.overrides["@agentclientprotocol/codex-acp@1.13.1>@openai/codex"], "0.160.0");
   assert.equal(rootPackage.pnpm.overrides["@agentclientprotocol/claude-agent-acp@0.73.0>@anthropic-ai/claude-agent-sdk"], "0.3.286");
   assert.deepEqual(runnerPackage.optionalDependencies, {
     "@github/copilot-darwin-arm64": "1.0.88",

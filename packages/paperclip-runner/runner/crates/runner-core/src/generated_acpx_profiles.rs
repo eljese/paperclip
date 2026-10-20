@@ -63,7 +63,7 @@ pub(crate) fn acpx_release_profile(agent: &str) -> Option<AcpxReleaseProfile> {
             agent_server_package: "@agentclientprotocol/codex-acp",
             agent_server_version: "1.13.1",
             agent_runtime_package: Some("@openai/codex"),
-            agent_runtime_version: Some("0.156.1"),
+            agent_runtime_version: Some("0.160.0"),
             command_digest:
                 "sha256:1592222a87fe2d4cf36fa6b05cc6aa2d8f3ce47ab7c498b7a46649905573357c",
             requires_provider_policy: false,

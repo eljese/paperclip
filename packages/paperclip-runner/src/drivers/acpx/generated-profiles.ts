@@ -79,7 +79,7 @@ export const QUALIFIED_ACPX_PROFILE_DATA = {
     "agentServerPackage": "@agentclientprotocol/codex-acp",
     "agentServerVersion": "1.13.1",
     "agentRuntimePackage": "@openai/codex",
-    "agentRuntimeVersion": "0.156.1",
+    "agentRuntimeVersion": "0.160.0",
     "commandDigest": "sha256:1592222a87fe2d4cf36fa6b05cc6aa2d8f3ce47ab7c498b7a46649905573357c",
     "permissionPolicy": "interactive"
   }
