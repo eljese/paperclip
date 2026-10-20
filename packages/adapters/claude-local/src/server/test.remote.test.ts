@@ -109,7 +109,7 @@ describe("claude sandbox auth-missing check", () => {
     const result = await testEnvironment({
       companyId: "company-1",
       adapterType: "claude_local",
-      config: { engine: "cli", command: "claude" },
+      config: { model: "claude-opus-5", engine: "cli", command: "claude" },
       executionTarget: sandboxTarget,
       environmentName: "Daytona",
     });
@@ -130,7 +130,7 @@ describe("claude sandbox auth-missing check", () => {
     const result = await testEnvironment({
       companyId: "company-1",
       adapterType: "claude_local",
-      config: { engine: "cli", command: "claude" },
+      config: { model: "claude-opus-5", engine: "cli", command: "claude" },
       executionTarget: sshTarget,
       environmentName: "Remote host",
     });
@@ -144,6 +144,7 @@ describe("claude CLI model compatibility check", () => {
   it.each([
     ["claude-fable-5-1", "2.1.251", "2.1.247"],
     ["claude-opus-5-5", "2.1.280", "2.1.279"],
+    ["claude-sonnet-5-5", "2.1.284", "2.1.283"],
   ])("fails before the hello probe for %s below CLI %s", async (model, minimumVersion, detectedVersion) => {
     probeResult.value = {
       exitCode: 0,

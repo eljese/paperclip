@@ -1,3 +1,6 @@
+import type { PluginAgentRuntimeState } from "./types.js";
+import type { AgentLifecycleRequest, AgentLifecycleResult } from "@paperclipai/shared";
+import type { AiConnectionRouterRequest, AiConnectionRouterResult } from "@paperclipai/shared";
 /**
  * JSON-RPC 2.0 message types and protocol helpers for the host ↔ worker IPC
  * channel.
@@ -30,7 +33,7 @@ import type {
   IssueAssigneeAdapterOverrides,
   IssueAttachment,
   IssueThreadInteraction,
-  CreateIssueThreadInteraction,
+  CreateIssueThreadInteractionInput,
   Approval,
   PluginManagedAgentResolution,
   PluginManagedProjectResolution,
@@ -53,6 +56,8 @@ export type { PluginLauncherRenderContextSnapshot } from "@paperclipai/shared";
 
 import type {
   PluginEvent,
+  ResourceLifecycleEvent,
+  ResourceLifecycleResult,
   PluginIssueCheckoutOwnership,
   PluginIssueOrchestrationSummary,
   PluginIssueRelationSummary,
@@ -631,6 +636,11 @@ export interface PluginEnvironmentRunnerIngressEndpointParams
 
 export interface PluginEnvironmentAcquireLeaseParams extends PluginEnvironmentDriverBaseParams {
   runId: string;
+  /** Explicit platform probes may request a provider-owned immutable snapshot
+   * identity. Supporting providers create by that ID and return snapshotIdentity
+   * in lease metadata. Older providers may omit it; the host then cannot qualify
+   * a mutable snapshot name. Ordinary discovery must not allocate a sandbox. */
+  resolveSnapshotIdentity?: boolean;
   workspaceMode?: string;
   requestedCwd?: string;
   agentId?: string;
@@ -681,6 +691,18 @@ export interface PluginEnvironmentTerminationReceipt {
 
 export interface PluginEnvironmentDestroyLeaseParams extends PluginEnvironmentReleaseLeaseParams {}
 
+/** Observe this exact allocation without starting, stopping or deleting it.
+ * Missing resources must be distinguished from permission/transport failures. */
+export interface PluginEnvironmentInspectLeaseParams extends PluginEnvironmentDriverBaseParams {
+  providerLeaseId: string;
+  leaseMetadata?: Record<string, unknown>;
+}
+
+export interface PluginEnvironmentLeaseObservation {
+  providerLeaseId: string;
+  state: "active" | "stopped" | "destroyed" | "unknown";
+}
+
 export interface PluginEnvironmentRealizeWorkspaceParams extends PluginEnvironmentDriverBaseParams {
   lease: PluginEnvironmentLease;
   workspace: {
@@ -710,6 +732,10 @@ export interface PluginEnvironmentExecuteParams extends PluginEnvironmentDriverB
   env?: Record<string, string>;
   stdin?: string;
   timeoutMs?: number;
+  /** Optional total command execution budget, in milliseconds. A session
+   * provider must keep this distinct from individual observation timeouts.
+   * Zero disables this deadline. Absence keeps the existing session lifetime. */
+  commandTimeoutMs?: number;
   /**
    * Run this command outside the lease's persistent session.
    *
@@ -1328,6 +1354,8 @@ export interface HostToWorkerMethods {
   health: [params: Record<string, never>, result: PluginHealthDiagnostics];
   /** @see PLUGIN_SPEC.md §12.5 */
   shutdown: [params: Record<string, never>, result: void];
+  prepareIdleSleep: [params: { ownerId: string; expiresAt: number }, result: { ownerId: string; expiresAt: number; backgroundWork: "none" | "present" | "unknown" }];
+  releaseIdleSleep: [params: { ownerId: string }, result: void];
   /** @see PLUGIN_SPEC.md §13.3 */
   validateConfig: [params: ValidateConfigParams, result: PluginConfigValidationResult];
   /** @see PLUGIN_SPEC.md §13.4 */
@@ -1341,6 +1369,8 @@ export interface HostToWorkerMethods {
   /** Scoped plugin API route dispatch. */
   handleApiRequest: [params: PluginApiRequestInput, result: PluginApiResponse];
   /** @see PLUGIN_SPEC.md §13.8 */
+  agentLifecycle: [params: AgentLifecycleRequest, result: AgentLifecycleResult];
+  resourceLifecycle: [params: ResourceLifecycleEvent, result: ResourceLifecycleResult];
   getData: [params: GetDataParams, result: unknown];
   /** @see PLUGIN_SPEC.md §13.9 */
   performAction: [params: PerformActionParams, result: unknown];
@@ -1350,6 +1380,7 @@ export interface HostToWorkerMethods {
     params: DetectExternalObjectsParams,
     result: DetectExternalObjectsResult,
   ];
+  routeAiConnection: [params: AiConnectionRouterRequest, result: AiConnectionRouterResult];
   resolveExternalObject: [
     params: ResolveExternalObjectParams,
     result: PluginExternalObjectResolveResult,
@@ -1385,6 +1416,10 @@ export interface HostToWorkerMethods {
   environmentDestroyLease: [
     params: PluginEnvironmentDestroyLeaseParams,
     result: PluginEnvironmentTerminationReceipt | void,
+  ];
+  environmentInspectLease: [
+    params: PluginEnvironmentInspectLeaseParams,
+    result: PluginEnvironmentLeaseObservation,
   ];
   environmentRealizeWorkspace: [
     params: PluginEnvironmentRealizeWorkspaceParams,
@@ -1468,16 +1503,21 @@ export const HOST_TO_WORKER_REQUIRED_METHODS: readonly HostToWorkerMethodName[] 
 
 /** Optional methods the worker MAY implement. */
 export const HOST_TO_WORKER_OPTIONAL_METHODS: readonly HostToWorkerMethodName[] = [
+  "prepareIdleSleep",
+  "releaseIdleSleep",
   "validateConfig",
   "configChanged",
   "onEvent",
   "runJob",
   "handleWebhook",
   "handleApiRequest",
+  "agentLifecycle",
+  "resourceLifecycle",
   "getData",
   "performAction",
   "executeTool",
   "detectExternalObjects",
+  "routeAiConnection",
   "resolveExternalObject",
   "refreshExternalObjects",
   "environmentValidateConfig",
@@ -1487,6 +1527,7 @@ export const HOST_TO_WORKER_OPTIONAL_METHODS: readonly HostToWorkerMethodName[] 
   "environmentReleaseLease",
   "environmentStopLease",
   "environmentDestroyLease",
+  "environmentInspectLease",
   "environmentRealizeWorkspace",
   "environmentExecute",
   "environmentRunnerIngressEndpoint",
@@ -1639,6 +1680,8 @@ export interface WorkerToHostMethods {
   ];
 
   // Events
+  "events.listLifecycle": [params: { companyId: string; limit?: number; afterId?: string }, result: ResourceLifecycleEvent[]];
+  "events.acknowledgeLifecycle": [params: { companyId: string; eventId: string }, result: void];
   "events.emit": [
     params: { name: string; companyId: string; payload: unknown },
     result: void,
@@ -2003,7 +2046,7 @@ export interface WorkerToHostMethods {
     params: {
       issueId: string;
       companyId: string;
-      interaction: CreateIssueThreadInteraction;
+      interaction: CreateIssueThreadInteractionInput;
       authorAgentId?: string | null;
     },
     result: IssueThreadInteraction,
@@ -2092,6 +2135,10 @@ export interface WorkerToHostMethods {
   "agents.list": [
     params: { companyId: string; status?: string; limit?: number; offset?: number },
     result: Agent[],
+  ];
+  "agents.getRuntime": [
+    params: { agentId: string; companyId: string },
+    result: PluginAgentRuntimeState | null,
   ];
   "agents.get": [
     params: { agentId: string; companyId: string },

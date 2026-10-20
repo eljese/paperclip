@@ -6,6 +6,7 @@
  * `getAdapterDisplay()`.
  */
 import type { ComponentType } from "react";
+import { agentHarnessType } from "@paperclipai/shared";
 import {
   Bot,
   Code,
@@ -127,6 +128,20 @@ const adapterDisplayMap: Record<string, AdapterDisplayInfo> = {
     description: "Cursor CLI harness",
     icon: MousePointer2,
   },
+  // Display-only choice: persisted as paperclip_runner with provider openai_dot.
+  grok_bot: { label: "Grok Bot", experimental: true, icon: Bot, description: "An existing external Bot in Grok" },
+  openai_dot: {
+    label: "OpenAI Dot",
+    description: "Your Dot in ChatGPT",
+    icon: Bot,
+    experimental: true,
+  },
+  muse: {
+    label: "Muse — Personal agent",
+    description: "Your personal Muse at muse.ai",
+    icon: Bot,
+    experimental: true,
+  },
   cursor_cloud: {
     label: "Cursor Cloud",
     description: "Managed remote Cursor agent",
@@ -198,6 +213,15 @@ export function getAdapterDisplay(type: string): AdapterDisplayInfo {
     description: suffix ? `External ${suffix} adapter` : "External adapter",
     icon: Cpu,
   };
+}
+
+export function agentDisplayAdapterType(agent: { adapterType: string; adapterConfig: Record<string, unknown> }): string {
+  if (agent.adapterType !== "paperclip_runner") return agent.adapterType;
+  if (agent.adapterConfig.provider === "openai_dot" || agent.adapterConfig.provider === "grok_bot" || agent.adapterConfig.provider === "muse") {
+    return agent.adapterConfig.provider;
+  }
+  const harness = agentHarnessType(agent.adapterType, agent.adapterConfig);
+  return ["codex_local", "claude_local"].includes(harness) ? harness : agent.adapterType;
 }
 
 export function isKnownAdapterType(type: string): boolean {

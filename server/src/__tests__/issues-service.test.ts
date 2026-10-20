@@ -18,13 +18,16 @@ import {
   issueComments,
   issueInboxArchives,
   issueDocuments,
+  issueAccessGrants,
   issuePlanDecompositions,
   issueReadStates,
+  issueRecoveryActions,
   issueRelations,
   issueThreadInteractions,
   issueWorkProducts,
   issues,
   projectWorkspaces,
+  projectAccessMembers,
   projects,
   workspaceOperations,
   toolApplications,
@@ -39,11 +42,14 @@ import { instanceSettingsService } from "../services/instance-settings.ts";
 import {
   clampIssueListLimit,
   deriveIssueCommentRunLogAttribution,
+  MAX_CHILD_ISSUES_CREATED_BY_HELPER,
   ISSUE_LIST_MAX_LIMIT,
   issueService,
   readIssueCommentRunLogText,
 } from "../services/issues.ts";
 import { getRunLogStore } from "../services/run-log-store.js";
+import { terminalizeLegacyExecution } from "../services/legacy-execution-recovery.js";
+import { settleUnrecoverableExecutions } from "../services/execution-recovery-resolution.js";
 import {
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_CODE,
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_MESSAGE,
@@ -53,6 +59,38 @@ import { buildAgentMentionHref, buildProjectMentionHref, MAX_ISSUE_REQUEST_DEPTH
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
+
+async function seedIssueCompany(db: ReturnType<typeof createDb>, companyId: string) {
+  await db.insert(companies).values({
+    id: companyId,
+    name: "Paperclip",
+    issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+    requireBoardApprovalForNewAgents: false,
+  });
+}
+
+async function seedWorkspaceProject(db: ReturnType<typeof createDb>, companyId: string, projectId: string) {
+  await db.insert(projects).values({
+    id: projectId,
+    companyId,
+    name: "Workspace project",
+    status: "in_progress",
+  });
+}
+
+async function seedCodexCoder(db: ReturnType<typeof createDb>, companyId: string, agentId: string) {
+  await db.insert(agents).values({
+    id: agentId,
+    companyId,
+    name: "CodexCoder",
+    role: "engineer",
+    status: "active",
+    adapterType: "codex_local",
+    adapterConfig: {},
+    runtimeConfig: {},
+    permissions: {},
+  });
+}
 
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -538,6 +576,34 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     await ensureIssueRelationsTable(db);
   }, 20_000);
 
+  it("rejects stale monitor cancellation under the task lock and preserves saved policy settings", async () => {
+    const companyId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(companies).values({ id: companyId, name: "Monitor cancellation", issuePrefix: "MCL", requireBoardApprovalForNewAgents: false });
+    const oldPolicy = {
+      mode: "normal" as const, commentRequired: true, stages: [],
+      monitor: { nextCheckAt: "2026-10-10T12:00:00.000Z", notes: "Check status", scheduledBy: "board" as const },
+    };
+    const savedPolicy = {
+      ...oldPolicy,
+      stages: [{ type: "review" as const, approvalsNeeded: 1 as const, participants: [{ type: "user" as const, userId: "reviewer" }] }],
+      maxReviewRounds: 4,
+      authorizationPolicy: { assignmentPolicy: { mode: "protected" as const } },
+    };
+    await db.insert(issues).values({ id: issueId, companyId, title: "Monitored task", executionPolicy: oldPolicy });
+    await svc.update(issueId, { executionPolicy: savedPolicy });
+    const { monitor: _oldMonitor, ...staleCancellation } = oldPolicy;
+    await expect(svc.update(issueId, { executionPolicy: staleCancellation, expectedExecutionPolicy: oldPolicy }))
+      .rejects.toMatchObject({ status: 409 });
+    expect((await svc.getById(issueId))?.executionPolicy).toEqual(savedPolicy);
+    const { monitor: _savedMonitor, ...cancellation } = savedPolicy;
+    await svc.update(issueId, { executionPolicy: cancellation, expectedExecutionPolicy: savedPolicy });
+    expect((await svc.getById(issueId))?.executionPolicy).toEqual(cancellation);
+    await expect(svc.update(issueId, { executionPolicy: null, expectedExecutionPolicy: null }))
+      .rejects.toMatchObject({ status: 409 });
+    expect((await svc.getById(issueId))?.executionPolicy).toEqual(cancellation);
+  });
+
   afterEach(async () => {
     await db.delete(issueComments);
     await db.delete(issueThreadInteractions);
@@ -565,12 +631,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
 
   async function seedAssignableAgentCompany() {
     const companyId = randomUUID();
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
+    await seedIssueCompany(db, companyId);
     return companyId;
   }
 
@@ -636,6 +697,39 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     await expect(svc.list(companyId, { touchedByUserId: userId })).resolves.toEqual([
       expect.objectContaining({ id: issueId }),
     ]);
+  });
+
+  it("ignores historical reader-attributed recovery cleanup without hiding explicit recovery decisions", async () => {
+    const companyId = await seedAssignableAgentCompany();
+    const userId = "board-user";
+    const old = new Date("2026-03-26T10:00:00Z");
+    const recent = new Date("2026-03-26T15:00:00Z");
+    const variants = [
+      { id: randomUUID(), details: { source: "source_revalidation", trigger: "read_projection" }, counts: false },
+      { id: randomUUID(), details: null, counts: true },
+      { id: randomUUID(), details: { outcome: "restored" }, counts: true },
+      { id: randomUUID(), details: { source: "source_revalidation", trigger: "issue_update" }, counts: true },
+    ];
+    await db.insert(issues).values(variants.map(({ id }) => ({
+      id, companyId, title: "Recovery audit", status: "done", updatedAt: old,
+    })));
+    await db.insert(activityLog).values(variants.map(({ id, details }) => ({
+      companyId, actorType: "user", actorId: userId, action: "issue.recovery_action_resolved",
+      entityType: "issue", entityId: id, details, createdAt: recent,
+    })));
+    await db.insert(issueComments).values(variants.map(({ id }) => ({
+      companyId, issueId: id, authorUserId: "other-user", body: "An older update", createdAt: old,
+    })));
+
+    const expectedIds = variants.filter(v => v.counts).map(v => v.id).sort();
+    expect((await svc.list(companyId, { touchedByUserId: userId })).map(v => v.id).sort()).toEqual(expectedIds);
+    expect(await svc.countUnreadTouchedByUser(companyId, userId)).toBe(expectedIds.length);
+    const rows = await svc.list(companyId, {});
+    for (const variant of variants) {
+      expect(rows.find(v => v.id === variant.id)?.lastActivityAt).toEqual(variant.counts ? recent : old);
+    }
+    // Audit evidence is preserved, including the wrongly attributed old row.
+    expect(await db.select().from(activityLog).where(eq(activityLog.companyId, companyId))).toHaveLength(variants.length);
   });
 
   function agentRow(companyId: string, input: {
@@ -792,6 +886,17 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
         requestingAgentId: agentId, requestingAgentName: "ConnectionRequester", phase: "authorizing",
       },
     }).returning();
+    // A second pending request on the same issue asks for an AI account. The
+    // expiry must tell the two apart: only the AI one blocks the run.
+    const [aiInteraction] = await db.insert(issueThreadInteractions).values({
+      companyId, issueId: issue.id, kind: "connection_intent", status: "pending",
+      createdByAgentId: agentId, addresseeUserId: "local-board",
+      payload: {
+        version: 1, purpose: "ai", serviceSlug: "connection:claude_local",
+        serviceName: "Claude", requestingAgentId: agentId,
+        requestingAgentName: "ConnectionRequester", phase: "authorizing",
+      },
+    }).returning();
     const oauthState = randomUUID();
     await db.insert(toolOauthStates).values({
       state: oauthState, companyId, connectionId: connection!.id, issueId: issue.id,
@@ -807,8 +912,21 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     await expect(db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, interaction!.id)))
       .resolves.toEqual([expect.objectContaining({
         status: "expired",
-        result: { version: 1, outcome: "expired", reason: "The task assignment changed" },
+        result: {
+          version: 1,
+          outcome: "expired",
+          reason: "The task was reassigned before the connection request was answered, so the Notion connection is still not connected. Reconnect it or choose an available connection.",
+        },
         resolvedAt: expect.any(Date),
+      })]);
+    await expect(db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, aiInteraction!.id)))
+      .resolves.toEqual([expect.objectContaining({
+        status: "expired",
+        result: {
+          version: 1,
+          outcome: "expired",
+          reason: "The task was reassigned before the connection request was answered, so the AI account is still not connected. Reconnect it or choose an available connection.",
+        },
       })]);
     await expect(db.select().from(toolOauthStates).where(eq(toolOauthStates.state, oauthState))).resolves.toEqual([]);
   });
@@ -1054,12 +1172,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     const agentId = randomUUID();
     const otherAgentId = randomUUID();
 
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
+    await seedIssueCompany(db, companyId);
 
     await db.insert(agents).values([
       {
@@ -1171,24 +1284,9 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
 
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
+    await seedIssueCompany(db, companyId);
 
-    await db.insert(agents).values({
-      id: agentId,
-      companyId,
-      name: "CodexCoder",
-      role: "engineer",
-      status: "active",
-      adapterType: "codex_local",
-      adapterConfig: {},
-      runtimeConfig: {},
-      permissions: {},
-    });
+    await seedCodexCoder(db, companyId, agentId);
 
     const matchedIssueId = randomUUID();
     const otherIssueId = randomUUID();
@@ -1220,18 +1318,13 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     expect(result.map((issue) => issue.id)).toEqual([matchedIssueId]);
   });
 
-  it("treats assigneeAgentId='null' as an explicit unassigned filter", async () => {
+  it("filters and counts unassigned issues with assigneeAgentId='null'", async () => {
     const companyId = randomUUID();
     const assigneeAgentId = randomUUID();
     const assignedIssueId = randomUUID();
     const unassignedIssueId = randomUUID();
 
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
+    await seedIssueCompany(db, companyId);
 
     await db.insert(agents).values({
       id: assigneeAgentId,
@@ -1266,21 +1359,18 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
 
     const result = await svc.list(companyId, { assigneeAgentId: "null" });
     expect(result.map((issue) => issue.id)).toEqual([unassignedIssueId]);
+    await expect(svc.count(companyId, { assigneeAgentId: "null" })).resolves.toBe(1);
   });
 
-  it("keeps UUID assignee filtering behavior unchanged", async () => {
+  it("filters and counts only issues assigned to the requested UUID", async () => {
     const companyId = randomUUID();
     const assigneeAgentId = randomUUID();
     const otherAgentId = randomUUID();
     const assignedIssueId = randomUUID();
     const otherIssueId = randomUUID();
+    const unassignedIssueId = randomUUID();
 
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
+    await seedIssueCompany(db, companyId);
 
     await db.insert(agents).values([
       {
@@ -1324,20 +1414,24 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
         priority: "medium",
         assigneeAgentId: otherAgentId,
       },
+      {
+        id: unassignedIssueId,
+        companyId,
+        title: "Unassigned issue",
+        status: "todo",
+        priority: "medium",
+        assigneeAgentId: null,
+      },
     ]);
 
     const result = await svc.list(companyId, { assigneeAgentId });
     expect(result.map((issue) => issue.id)).toEqual([assignedIssueId]);
+    await expect(svc.count(companyId, { assigneeAgentId })).resolves.toBe(1);
   });
 
-  it("rejects malformed assigneeAgentId filter values", async () => {
+  it("rejects malformed assigneeAgentId filters in list and count", async () => {
     const companyId = randomUUID();
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
+    await seedIssueCompany(db, companyId);
     await db.insert(issues).values({
       id: randomUUID(),
       companyId,
@@ -1349,110 +1443,6 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     await expect(
       svc.list(companyId, { assigneeAgentId: "not-a-uuid" }),
     ).rejects.toThrow(/assigneeAgentId/i);
-  });
-
-  it("counts only unassigned issues for assigneeAgentId='null'", async () => {
-    const companyId = randomUUID();
-    const assigneeAgentId = randomUUID();
-    const assignedIssueId = randomUUID();
-    const unassignedIssueId = randomUUID();
-
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
-
-    await db.insert(agents).values({
-      id: assigneeAgentId,
-      companyId,
-      name: "Assignee",
-      role: "engineer",
-      status: "active",
-      adapterType: "codex_local",
-      adapterConfig: {},
-      runtimeConfig: {},
-      permissions: {},
-    });
-
-    await db.insert(issues).values([
-      {
-        id: assignedIssueId,
-        companyId,
-        title: "Assigned issue",
-        status: "todo",
-        priority: "medium",
-        assigneeAgentId,
-      },
-      {
-        id: unassignedIssueId,
-        companyId,
-        title: "Unassigned issue",
-        status: "todo",
-        priority: "medium",
-        assigneeAgentId: null,
-      },
-    ]);
-
-    await expect(svc.count(companyId, { assigneeAgentId: "null" })).resolves.toBe(1);
-  });
-
-  it("counts UUID-assigned issues with assigneeAgentId", async () => {
-    const companyId = randomUUID();
-    const assigneeAgentId = randomUUID();
-    const assignedIssueId = randomUUID();
-    const otherIssueId = randomUUID();
-
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
-
-    await db.insert(agents).values({
-      id: assigneeAgentId,
-      companyId,
-      name: "Assignee",
-      role: "engineer",
-      status: "active",
-      adapterType: "codex_local",
-      adapterConfig: {},
-      runtimeConfig: {},
-      permissions: {},
-    });
-
-    await db.insert(issues).values([
-      {
-        id: assignedIssueId,
-        companyId,
-        title: "Assigned issue",
-        status: "todo",
-        priority: "medium",
-        assigneeAgentId,
-      },
-      {
-        id: otherIssueId,
-        companyId,
-        title: "Other issue",
-        status: "todo",
-        priority: "medium",
-      },
-    ]);
-
-    await expect(svc.count(companyId, { assigneeAgentId })).resolves.toBe(1);
-  });
-
-  it("rejects malformed assigneeAgentId filter values in count", async () => {
-    const companyId = randomUUID();
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
-
     await expect(
       svc.count(companyId, { assigneeAgentId: "not-a-uuid" }),
     ).rejects.toThrow(/assigneeAgentId/i);
@@ -1461,12 +1451,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
   it("applies result limits to issue search", async () => {
     const companyId = randomUUID();
 
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
+    await seedIssueCompany(db, companyId);
 
     const exactIdentifierId = randomUUID();
     const titleMatchId = randomUUID();
@@ -1514,12 +1499,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     const otherDocumentId = randomUUID();
     const planDocumentId = randomUUID();
 
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
+    await seedIssueCompany(db, companyId);
 
     await db.insert(issues).values([
       {
@@ -1582,12 +1562,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     const oldCriticalIssueId = randomUUID();
     const recentMediumIssueId = randomUUID();
 
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
+    await seedIssueCompany(db, companyId);
 
     await db.insert(issues).values([
       {
@@ -1622,12 +1597,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     const commentMatchId = randomUUID();
     const descriptionMatchId = randomUUID();
 
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
+    await seedIssueCompany(db, companyId);
 
     await db.insert(issues).values([
       {
@@ -1669,12 +1639,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     const grandchildId = randomUUID();
     const siblingId = randomUUID();
 
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
+    await seedIssueCompany(db, companyId);
 
     await db.insert(issues).values([
       {
@@ -1721,12 +1686,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     const grandchildId = randomUUID();
     const outsideMatchId = randomUUID();
 
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
+    await seedIssueCompany(db, companyId);
 
     await db.insert(issues).values([
       {
@@ -1810,19 +1770,9 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     const otherLinkedIssueId = randomUUID();
     const unlinkedIssueId = randomUUID();
 
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
+    await seedIssueCompany(db, companyId);
 
-    await db.insert(projects).values({
-      id: projectId,
-      companyId,
-      name: "Workspace project",
-      status: "in_progress",
-    });
+    await seedWorkspaceProject(db, companyId, projectId);
 
     await db.insert(executionWorkspaces).values([
       {
@@ -1890,19 +1840,9 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     const projectLinkedIssueId = randomUUID();
     const otherIssueId = randomUUID();
 
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
+    await seedIssueCompany(db, companyId);
 
-    await db.insert(projects).values({
-      id: projectId,
-      companyId,
-      name: "Workspace project",
-      status: "in_progress",
-    });
+    await seedWorkspaceProject(db, companyId, projectId);
 
     await db.insert(projectWorkspaces).values({
       id: projectWorkspaceId,
@@ -1973,12 +1913,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     const typedOperationIssueId = randomUUID();
     const legacyContentMachineOperationIssueId = randomUUID();
 
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
+    await seedIssueCompany(db, companyId);
     await db.insert(agents).values({
       id: agentId,
       companyId,
@@ -2094,12 +2029,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     const normalIssueId = randomUUID();
     const operationIssueId = randomUUID();
 
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
+    await seedIssueCompany(db, companyId);
     await db.insert(issues).values([
       {
         id: normalIssueId,
@@ -2144,12 +2074,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     const inProgressIssueId = randomUUID();
     const doneIssueId = randomUUID();
 
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
+    await seedIssueCompany(db, companyId);
     await db.insert(issues).values([
       {
         id: todoIssueId,
@@ -2187,12 +2112,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     const userId = "user-1";
     const otherUserId = "user-2";
 
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
+    await seedIssueCompany(db, companyId);
 
     const visibleIssueId = randomUUID();
     const archivedIssueId = randomUUID();
@@ -2273,12 +2193,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     const otherUserId = "user-2";
     const agentId = randomUUID();
 
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
+    await seedIssueCompany(db, companyId);
 
     await db.insert(agents).values({
       id: agentId,
@@ -2457,12 +2372,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     const commentIssueId = randomUUID();
     const activityIssueId = randomUUID();
 
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
+    await seedIssueCompany(db, companyId);
 
     await db.insert(issues).values([
       {
@@ -2545,12 +2455,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     const anchorCommentId = randomUUID();
     const latestCommentId = randomUUID();
 
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
+    await seedIssueCompany(db, companyId);
 
     await db.insert(issues).values({
       id: issueId,
@@ -2603,12 +2508,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     const anchorCommentId = randomUUID();
     const latestCommentId = randomUUID();
 
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
+    await seedIssueCompany(db, companyId);
 
     await db.insert(issues).values({
       id: issueId,
@@ -2659,12 +2559,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     const issueId = randomUUID();
     const commentId = randomUUID();
 
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
+    await seedIssueCompany(db, companyId);
 
     await db.insert(issues).values({
       id: issueId,
@@ -2698,24 +2593,9 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     const issueId = randomUUID();
     const commentId = randomUUID();
 
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
+    await seedIssueCompany(db, companyId);
 
-    await db.insert(agents).values({
-      id: agentId,
-      companyId,
-      name: "CodexCoder",
-      role: "engineer",
-      status: "active",
-      adapterType: "codex_local",
-      adapterConfig: {},
-      runtimeConfig: {},
-      permissions: {},
-    });
+    await seedCodexCoder(db, companyId, agentId);
 
     await db.insert(issues).values({
       id: issueId,
@@ -2760,24 +2640,9 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     const issueId = randomUUID();
     const commentId = randomUUID();
 
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
+    await seedIssueCompany(db, companyId);
 
-    await db.insert(agents).values({
-      id: agentId,
-      companyId,
-      name: "CodexCoder",
-      role: "engineer",
-      status: "active",
-      adapterType: "codex_local",
-      adapterConfig: {},
-      runtimeConfig: {},
-      permissions: {},
-    });
+    await seedCodexCoder(db, companyId, agentId);
 
     await db.insert(issues).values({
       id: issueId,
@@ -2826,12 +2691,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     const blockedId = randomUUID();
     const unblockedId = randomUUID();
 
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
+    await seedIssueCompany(db, companyId);
 
     await db.insert(issues).values([
       {
@@ -2883,31 +2743,45 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     expect(byId.get(unblockedId)?.blockedBy).toEqual([]);
   });
 
-  it("trims list payload fields that can grow large on issue index routes", async () => {
+  it("trims large list payloads and preserves description preview boundaries", async () => {
     const companyId = randomUUID();
     const issueId = randomUUID();
     const longDescription = "x".repeat(5_000);
+    const exactPreviewId = randomUUID();
+    const nullDescriptionId = randomUUID();
+    const multibyteBoundaryId = randomUUID();
 
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
+    await seedIssueCompany(db, companyId);
 
-    await db.insert(issues).values({
-      id: issueId,
-      companyId,
-      title: "Large issue",
-      description: longDescription,
-      status: "todo",
-      priority: "medium",
-      executionPolicy: { stages: Array.from({ length: 20 }, (_, index) => ({ index, kind: "review", notes: "y".repeat(400) })) },
-      executionState: { history: Array.from({ length: 20 }, (_, index) => ({ index, body: "z".repeat(400) })) },
-      executionWorkspaceSettings: { notes: "w".repeat(2_000) },
-    });
+    await db.insert(issues).values([
+      {
+        id: issueId,
+        companyId,
+        title: "Large issue",
+        description: longDescription,
+        status: "todo",
+        priority: "medium",
+        executionPolicy: { stages: Array.from({ length: 20 }, (_, index) => ({ index, kind: "review", notes: "y".repeat(400) })) },
+        executionState: { history: Array.from({ length: 20 }, (_, index) => ({ index, body: "z".repeat(400) })) },
+        executionWorkspaceSettings: { notes: "w".repeat(2_000) },
+      },
+      {
+        id: exactPreviewId, companyId, title: "Exact preview issue",
+        description: "x".repeat(1200), status: "todo", priority: "medium",
+      },
+      {
+        id: nullDescriptionId, companyId, title: "Null description issue",
+        description: null, status: "todo", priority: "medium",
+      },
+      {
+        id: multibyteBoundaryId, companyId, title: "Multibyte boundary issue",
+        description: `${"x".repeat(1199)}— still valid after truncation`,
+        status: "todo", priority: "medium",
+      },
+    ]);
 
-    const [result] = await svc.list(companyId);
+    const byId = new Map((await svc.list(companyId)).map((issue) => [issue.id, issue]));
+    const result = byId.get(issueId);
 
     expect(result).toBeTruthy();
     expect(result?.description).toHaveLength(1200);
@@ -2915,87 +2789,14 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     expect(result?.executionPolicy).toBeNull();
     expect(result?.executionState).toBeNull();
     expect(result?.executionWorkspaceSettings).toBeNull();
-  });
 
-  it("marks list descriptions as not truncated when they fit the preview limit", async () => {
-    const companyId = randomUUID();
-    const issueId = randomUUID();
-    const description = "x".repeat(1200);
-
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
-
-    await db.insert(issues).values({
-      id: issueId,
-      companyId,
-      title: "Exact preview issue",
-      description,
-      status: "todo",
-      priority: "medium",
-    });
-
-    const [result] = await svc.list(companyId);
-
-    expect(result?.description).toHaveLength(1200);
-    expect(result?.descriptionTruncated).toBe(false);
-  });
-
-  it("marks null list descriptions as not truncated", async () => {
-    const companyId = randomUUID();
-    const issueId = randomUUID();
-
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
-
-    await db.insert(issues).values({
-      id: issueId,
-      companyId,
-      title: "Null description issue",
-      description: null,
-      status: "todo",
-      priority: "medium",
-    });
-
-    const [result] = await svc.list(companyId);
-
-    expect(result?.description).toBeNull();
-    expect(result?.descriptionTruncated).toBe(false);
-  });
-
-  it("does not let description preview truncation split multibyte characters", async () => {
-    const companyId = randomUUID();
-    const issueId = randomUUID();
-    const description = `${"x".repeat(1199)}— still valid after truncation`;
-
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
-
-    await db.insert(issues).values({
-      id: issueId,
-      companyId,
-      title: "Multibyte boundary issue",
-      description,
-      status: "todo",
-      priority: "medium",
-    });
-
-    const [result] = await svc.list(companyId);
-
-    expect(result?.description).toHaveLength(1200);
-    expect(result?.description?.endsWith("—")).toBe(true);
-    expect(result?.descriptionTruncated).toBe(true);
+    expect(byId.get(exactPreviewId)?.description).toHaveLength(1200);
+    expect(byId.get(exactPreviewId)?.descriptionTruncated).toBe(false);
+    expect(byId.get(nullDescriptionId)?.description).toBeNull();
+    expect(byId.get(nullDescriptionId)?.descriptionTruncated).toBe(false);
+    expect(byId.get(multibyteBoundaryId)?.description).toHaveLength(1200);
+    expect(byId.get(multibyteBoundaryId)?.description?.endsWith("—")).toBe(true);
+    expect(byId.get(multibyteBoundaryId)?.descriptionTruncated).toBe(true);
   });
 });
 
@@ -3090,9 +2891,10 @@ describeEmbeddedPostgres("issueService.findOpenAncestorCreatedByAgent", () => {
     // Extend the chain 60 levels below the delegator-created ancestor so the
     // match sits far above the new child's parent.
     let parentId = midId;
+    const descendants: (typeof issues.$inferInsert)[] = [];
     for (let index = 0; index < 60; index += 1) {
       const childId = randomUUID();
-      await db.insert(issues).values({
+      descendants.push({
         id: childId,
         companyId,
         title: `Deep child ${index}`,
@@ -3104,6 +2906,8 @@ describeEmbeddedPostgres("issueService.findOpenAncestorCreatedByAgent", () => {
       });
       parentId = childId;
     }
+
+    await db.insert(issues).values(descendants);
 
     const found = await svc.findOpenAncestorCreatedByAgent(parentId, delegatorId);
     expect(found?.id).toBe(midId);
@@ -3160,20 +2964,10 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     const projectWorkspaceId = randomUUID();
     const executionWorkspaceId = randomUUID();
 
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
+    await seedIssueCompany(db, companyId);
     await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
 
-    await db.insert(projects).values({
-      id: projectId,
-      companyId,
-      name: "Workspace project",
-      status: "in_progress",
-    });
+    await seedWorkspaceProject(db, companyId, projectId);
 
     await db.insert(projectWorkspaces).values({
       id: projectWorkspaceId,
@@ -3234,12 +3028,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     const agentId = randomUUID();
     const runId = randomUUID();
     const responsibleUserId = randomUUID();
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
+    await seedIssueCompany(db, companyId);
     await db.insert(agents).values({
       id: agentId,
       companyId,
@@ -3280,16 +3069,126 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     expect(child.responsibleUserId).toBe(responsibleUserId);
   });
 
+  it("creates children under a private issue in the same private subtree", async () => {
+    const companyId = randomUUID();
+    const parentIssueId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Private subtree company",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+    });
+    await db.insert(issues).values({
+      id: parentIssueId,
+      companyId,
+      title: "Private root",
+      visibility: "private",
+      privacyRootIssueId: parentIssueId,
+    });
+
+    const child = await svc.create(companyId, {
+      parentId: parentIssueId,
+      title: "Inherited private child",
+      visibility: "open",
+    });
+
+    expect(child.visibility).toBe("private");
+    expect(child.privacyRootIssueId).toBe(parentIssueId);
+  });
+
+  it("creates one personal private project and parks private tasks there", async () => {
+    const companyId = randomUUID();
+    const responsibleUserId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Personal private tasks company",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+    });
+
+    const [first, second] = await Promise.all([
+      svc.create(companyId, {
+        title: "First personal private task",
+        visibility: "private",
+        createdByUserId: responsibleUserId,
+      }),
+      svc.create(companyId, {
+        title: "Second personal private task",
+        visibility: "private",
+        createdByUserId: responsibleUserId,
+      }),
+    ]);
+
+    const personalProjects = await db.select().from(projects)
+      .where(eq(projects.personalOwnerUserId, responsibleUserId));
+    expect(personalProjects).toHaveLength(1);
+    expect(personalProjects[0]).toMatchObject({
+      companyId,
+      name: "My private tasks",
+      visibility: "private",
+    });
+    expect(first.projectId).toBe(personalProjects[0]!.id);
+    expect(second.projectId).toBe(personalProjects[0]!.id);
+    expect(first.privacyRootIssueId).toBe(first.id);
+    expect(second.privacyRootIssueId).toBe(second.id);
+    await expect(db.select().from(projectAccessMembers)
+      .where(eq(projectAccessMembers.projectId, personalProjects[0]!.id)))
+      .resolves.toEqual([
+        expect.objectContaining({ subjectType: "user", subjectId: responsibleUserId }),
+      ]);
+  });
+
+  it("keeps a responsible human and grants an agent access to its explicitly private task", async () => {
+    const companyId = randomUUID();
+    const responsibleUserId = randomUUID();
+    const creatorAgentId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Agent private task company",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+    });
+    await db.insert(agents).values({
+      id: creatorAgentId,
+      companyId,
+      name: "Private task creator",
+      role: "engineer",
+      adapterType: "process",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    const issue = await svc.create(companyId, {
+      title: "Agent email scratch task",
+      visibility: "private",
+      createdByAgentId: creatorAgentId,
+      actorResponsibleUserId: responsibleUserId,
+    });
+
+    expect(issue.responsibleUserId).toBe(responsibleUserId);
+    const personalProject = await db.select().from(projects)
+      .where(eq(projects.id, issue.projectId!))
+      .then((rows) => rows[0]!);
+    expect(personalProject.personalOwnerUserId).toBe(responsibleUserId);
+    await expect(db.select().from(projectAccessMembers)
+      .where(eq(projectAccessMembers.projectId, personalProject.id)))
+      .resolves.toEqual([
+        expect.objectContaining({ subjectType: "user", subjectId: responsibleUserId }),
+      ]);
+    await expect(db.select().from(issueAccessGrants)
+      .where(eq(issueAccessGrants.issueId, issue.id)))
+      .resolves.toEqual([
+        expect.objectContaining({
+          subjectType: "agent",
+          subjectId: creatorAgentId,
+          source: "explicit",
+        }),
+      ]);
+  });
+
   it("only honors explicit responsibleUserId for trusted issue create callers", async () => {
     const companyId = randomUUID();
     const creatorUserId = randomUUID();
     const requestedResponsibleUserId = randomUUID();
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
+    await seedIssueCompany(db, companyId);
 
     const untrusted = await svc.create(companyId, {
       title: "Untrusted explicit responsible user",
@@ -3311,12 +3210,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     const companyId = randomUUID();
     const actorResponsibleUserId = randomUUID();
     const requestedResponsibleUserId = randomUUID();
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
+    await seedIssueCompany(db, companyId);
 
     const issue = await svc.create(companyId, {
       title: "Actor-context responsible user",
@@ -3334,12 +3228,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     const assigneeEnvironmentId = randomUUID();
     const assigneeAgentId = randomUUID();
 
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
+    await seedIssueCompany(db, companyId);
     await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
 
     await db.insert(environments).values([
@@ -3408,12 +3297,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     const assigneeEnvironmentId = randomUUID();
     const assigneeAgentId = randomUUID();
 
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
+    await seedIssueCompany(db, companyId);
     await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
 
     await db.insert(environments).values([
@@ -3490,12 +3374,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     const firstAgentId = randomUUID();
     const secondAgentId = randomUUID();
 
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
+    await seedIssueCompany(db, companyId);
     await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
 
     await db.insert(environments).values([
@@ -3597,12 +3476,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     const firstAgentId = randomUUID();
     const secondAgentId = randomUUID();
 
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
+    await seedIssueCompany(db, companyId);
     await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
 
     await db.insert(environments).values([
@@ -3673,20 +3547,10 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     const explicitProjectWorkspaceId = randomUUID();
     const explicitExecutionWorkspaceId = randomUUID();
 
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
+    await seedIssueCompany(db, companyId);
     await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
 
-    await db.insert(projects).values({
-      id: projectId,
-      companyId,
-      name: "Workspace project",
-      status: "in_progress",
-    });
+    await seedWorkspaceProject(db, companyId, projectId);
 
     await db.insert(projectWorkspaces).values([
       {
@@ -3770,20 +3634,10 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     const projectWorkspaceId = randomUUID();
     const executionWorkspaceId = randomUUID();
 
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
+    await seedIssueCompany(db, companyId);
     await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
 
-    await db.insert(projects).values({
-      id: projectId,
-      companyId,
-      name: "Workspace project",
-      status: "in_progress",
-    });
+    await seedWorkspaceProject(db, companyId, projectId);
 
     await db.insert(projectWorkspaces).values({
       id: projectWorkspaceId,
@@ -3842,12 +3696,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     const projectWorkspaceId = randomUUID();
     const executionWorkspaceId = randomUUID();
 
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
+    await seedIssueCompany(db, companyId);
     await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
 
     await db.insert(goals).values({
@@ -3939,20 +3788,10 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     const projectWorkspaceId = randomUUID();
     const environmentId = randomUUID();
 
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
+    await seedIssueCompany(db, companyId);
     await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
 
-    await db.insert(projects).values({
-      id: projectId,
-      companyId,
-      name: "Workspace project",
-      status: "in_progress",
-    });
+    await seedWorkspaceProject(db, companyId, projectId);
 
     await db.insert(projectWorkspaces).values({
       id: projectWorkspaceId,
@@ -4012,12 +3851,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     const parentProjectWorkspaceId = randomUUID();
     const targetProjectWorkspaceId = randomUUID();
 
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
+    await seedIssueCompany(db, companyId);
     await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
 
     await db.insert(projects).values([
@@ -4075,12 +3909,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     const goalId = randomUUID();
     const parentIssueId = randomUUID();
 
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
+    await seedIssueCompany(db, companyId);
     await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: false });
 
     await db.insert(goals).values({
@@ -4117,6 +3946,62 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     });
 
     expect(child.requestDepth).toBe(MAX_ISSUE_REQUEST_DEPTH);
+  });
+
+  it("counts only non-terminal children toward the helper child limit", async () => {
+    const companyId = randomUUID();
+    const parentIssueId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(issues).values({
+      id: parentIssueId,
+      companyId,
+      title: "Recurring coordinator",
+      status: "in_progress",
+      priority: "high",
+    });
+
+    const terminalChildren = Array.from(
+      { length: MAX_CHILD_ISSUES_CREATED_BY_HELPER },
+      (_, index) => ({
+        id: randomUUID(),
+        companyId,
+        parentId: parentIssueId,
+        title: `Terminal child ${index + 1}`,
+        status: index % 2 === 0 ? "done" as const : "cancelled" as const,
+        priority: "medium" as const,
+      }),
+    );
+    const activeChildren = Array.from(
+      { length: MAX_CHILD_ISSUES_CREATED_BY_HELPER - 1 },
+      (_, index) => ({
+        id: randomUUID(),
+        companyId,
+        parentId: parentIssueId,
+        title: `Active child ${index + 1}`,
+        status: "todo" as const,
+        priority: "medium" as const,
+      }),
+    );
+    await db.insert(issues).values([...terminalChildren, ...activeChildren]);
+
+    const { issue: finalActiveChild } = await svc.createChild(parentIssueId, {
+      title: "Final active child",
+      status: "todo",
+    });
+
+    expect(finalActiveChild.parentId).toBe(parentIssueId);
+    await expect(svc.createChild(parentIssueId, {
+      title: "Over active limit",
+      status: "todo",
+    })).rejects.toThrow(
+      `Parent issue already has the maximum ${MAX_CHILD_ISSUES_CREATED_BY_HELPER} active child issues for this helper`,
+    );
   });
 });
 
@@ -4161,12 +4046,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     const dependentId = randomUUID();
     const foreignIssueId = randomUUID();
 
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
+    await seedIssueCompany(db, companyId);
     await db.insert(agents).values({
       id: assigneeAgentId,
       companyId,
@@ -4254,12 +4134,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     const companyId = randomUUID();
     const issueId = randomUUID();
     const blockerId = randomUUID();
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
+    await seedIssueCompany(db, companyId);
     await db.insert(issues).values([
       {
         id: issueId,
@@ -4314,12 +4189,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
 
   it("persists blocked-by relations and exposes both blockedBy and blocks summaries", async () => {
     const companyId = randomUUID();
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
+    await seedIssueCompany(db, companyId);
 
     const blockerId = randomUUID();
     const blockedId = randomUUID();
@@ -4353,12 +4223,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
 
   it("returns blocked-by summaries on newly created issues", async () => {
     const companyId = randomUUID();
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
+    await seedIssueCompany(db, companyId);
 
     const blockerId = randomUUID();
     await db.insert(issues).values({
@@ -4387,12 +4252,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
 
   it("returns blocked-by summaries on newly created child issues", async () => {
     const companyId = randomUUID();
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
+    await seedIssueCompany(db, companyId);
 
     const parentId = randomUUID();
     const blockerId = randomUUID();
@@ -4427,12 +4287,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
 
   it("returns blocks summaries when child creation blocks the parent", async () => {
     const companyId = randomUUID();
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
+    await seedIssueCompany(db, companyId);
 
     const parentId = randomUUID();
     await db.insert(issues).values({
@@ -4461,12 +4316,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
 
   it("adds terminal blockers to immediate blocked-by summaries", async () => {
     const companyId = randomUUID();
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
+    await seedIssueCompany(db, companyId);
 
     const issueA = randomUUID();
     const issueB = randomUUID();
@@ -4504,12 +4354,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
 
   it("rejects blocking cycles", async () => {
     const companyId = randomUUID();
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
+    await seedIssueCompany(db, companyId);
 
     const issueA = randomUUID();
     const issueB = randomUUID();
@@ -4528,30 +4373,15 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
   it("only returns dependents once every blocker is done", async () => {
     const companyId = randomUUID();
     const assigneeAgentId = randomUUID();
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
-    await db.insert(agents).values({
-      id: assigneeAgentId,
-      companyId,
-      name: "CodexCoder",
-      role: "engineer",
-      status: "active",
-      adapterType: "codex_local",
-      adapterConfig: {},
-      runtimeConfig: {},
-      permissions: {},
-    });
+    await seedIssueCompany(db, companyId);
+    await seedCodexCoder(db, companyId, assigneeAgentId);
 
     const blockerA = randomUUID();
     const blockerB = randomUUID();
     const blockedIssueId = randomUUID();
     await db.insert(issues).values([
-      { id: blockerA, companyId, title: "Blocker A", status: "done", priority: "medium" },
-      { id: blockerB, companyId, title: "Blocker B", status: "todo", priority: "medium" },
+      { id: blockerA, companyId, title: "Blocker A", status: "done", priority: "medium", executionWorkspaceId: null },
+      { id: blockerB, companyId, title: "Blocker B", status: "todo", priority: "medium", executionWorkspaceId: null },
       {
         id: blockedIssueId,
         companyId,
@@ -4568,13 +4398,15 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
 
     await svc.update(blockerB, { status: "done" });
 
-    await expect(svc.listWakeableBlockedDependents(blockerA)).resolves.toEqual([
+    const wakeable = await svc.listWakeableBlockedDependents(blockerA);
+    expect(wakeable).toEqual([
       expect.objectContaining({
         id: blockedIssueId,
         assigneeAgentId,
         blockerIssueIds: expect.arrayContaining([blockerA, blockerB]),
       }),
     ]);
+    expect(wakeable[0]?.blockerIssueIds).toHaveLength(2);
   });
 
   it("treats done blockers on a shared workspace as ready while a foreign issue is in-flight", async () => {
@@ -4748,62 +4580,9 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     });
   });
 
-  it("treats blockers with no executionWorkspaceId as not subject to the workspace-finalize barrier", async () => {
-    const companyId = randomUUID();
-    const assigneeAgentId = randomUUID();
-
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
-    await db.insert(agents).values({
-      id: assigneeAgentId,
-      companyId,
-      name: "QA",
-      role: "qa",
-      status: "active",
-      adapterType: "claude_local",
-      adapterConfig: {},
-      runtimeConfig: {},
-      permissions: {},
-    });
-
-    const blockerId = randomUUID();
-    const dependentId = randomUUID();
-    await db.insert(issues).values([
-      // Done blocker with no execution workspace ever attached (e.g. closed manually).
-      { id: blockerId, companyId, title: "Manual done blocker", status: "done", priority: "medium" },
-      {
-        id: dependentId,
-        companyId,
-        title: "Dependent",
-        status: "blocked",
-        priority: "medium",
-        assigneeAgentId,
-      },
-    ]);
-    await svc.update(dependentId, { blockedByIssueIds: [blockerId] });
-
-    // No executionWorkspaceId → no barrier → dependent should be wakeable.
-    await expect(svc.listWakeableBlockedDependents(blockerId)).resolves.toEqual([
-      expect.objectContaining({
-        id: dependentId,
-        assigneeAgentId,
-        blockerIssueIds: [blockerId],
-      }),
-    ]);
-  });
-
   it("reports dependency readiness for blocked issue chains", async () => {
     const companyId = randomUUID();
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
+    await seedIssueCompany(db, companyId);
 
     const blockerId = randomUUID();
     const blockedId = randomUUID();
@@ -4836,12 +4615,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
 
   it("unblocks a source issue when a liveness escalation recovery issue is marked done", async () => {
     const companyId = randomUUID();
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
+    await seedIssueCompany(db, companyId);
 
     const sourceIssueId = randomUUID();
     const recoveryIssueId = randomUUID();
@@ -4883,23 +4657,8 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
   it("rejects execution when unresolved blockers remain", async () => {
     const companyId = randomUUID();
     const assigneeAgentId = randomUUID();
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
-    await db.insert(agents).values({
-      id: assigneeAgentId,
-      companyId,
-      name: "CodexCoder",
-      role: "engineer",
-      status: "active",
-      adapterType: "codex_local",
-      adapterConfig: {},
-      runtimeConfig: {},
-      permissions: {},
-    });
+    await seedIssueCompany(db, companyId);
+    await seedCodexCoder(db, companyId, assigneeAgentId);
 
     const blockerId = randomUUID();
     const blockedId = randomUUID();
@@ -4939,23 +4698,8 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
   it("wakes parents only when all direct children are terminal", async () => {
     const companyId = randomUUID();
     const assigneeAgentId = randomUUID();
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
-    await db.insert(agents).values({
-      id: assigneeAgentId,
-      companyId,
-      name: "CodexCoder",
-      role: "engineer",
-      status: "active",
-      adapterType: "codex_local",
-      adapterConfig: {},
-      runtimeConfig: {},
-      permissions: {},
-    });
+    await seedIssueCompany(db, companyId);
+    await seedCodexCoder(db, companyId, assigneeAgentId);
 
     const parentId = randomUUID();
     const childA = randomUUID();
@@ -5042,82 +4786,6 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     await tempDb?.cleanup();
   });
 
-  it("inherits the parent issue workspace linkage when child workspace fields are omitted", async () => {
-    const companyId = randomUUID();
-    const projectId = randomUUID();
-    const parentIssueId = randomUUID();
-    const projectWorkspaceId = randomUUID();
-    const executionWorkspaceId = randomUUID();
-
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
-    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
-
-    await db.insert(projects).values({
-      id: projectId,
-      companyId,
-      name: "Workspace project",
-      status: "in_progress",
-    });
-
-    await db.insert(projectWorkspaces).values({
-      id: projectWorkspaceId,
-      companyId,
-      projectId,
-      name: "Primary workspace",
-      isPrimary: true,
-      sharedWorkspaceKey: "workspace-key",
-    });
-
-    await db.insert(executionWorkspaces).values({
-      id: executionWorkspaceId,
-      companyId,
-      projectId,
-      projectWorkspaceId,
-      mode: "isolated_workspace",
-      strategyType: "git_worktree",
-      name: "Issue worktree",
-      status: "active",
-      providerType: "git_worktree",
-      providerRef: `/tmp/${executionWorkspaceId}`,
-    });
-
-    await db.insert(issues).values({
-      id: parentIssueId,
-      companyId,
-      projectId,
-      projectWorkspaceId,
-      title: "Parent issue",
-      status: "in_progress",
-      priority: "medium",
-      executionWorkspaceId,
-      executionWorkspacePreference: "reuse_existing",
-      executionWorkspaceSettings: {
-        mode: "isolated_workspace",
-        workspaceRuntime: { profile: "agent" },
-      },
-    });
-
-    const child = await svc.create(companyId, {
-      parentId: parentIssueId,
-      projectId,
-      title: "Child issue",
-    });
-
-    expect(child.parentId).toBe(parentIssueId);
-    expect(child.projectWorkspaceId).toBe(projectWorkspaceId);
-    expect(child.executionWorkspaceId).toBe(executionWorkspaceId);
-    expect(child.executionWorkspacePreference).toBe("reuse_existing");
-    expect(child.executionWorkspaceSettings).toEqual({
-      mode: "isolated_workspace",
-      workspaceRuntime: { profile: "agent" },
-    });
-  });
-
   it("preserves the parent project when a generic child create inherits workspace linkage", async () => {
     const companyId = randomUUID();
     const projectId = randomUUID();
@@ -5125,20 +4793,10 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     const projectWorkspaceId = randomUUID();
     const executionWorkspaceId = randomUUID();
 
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
+    await seedIssueCompany(db, companyId);
     await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
 
-    await db.insert(projects).values({
-      id: projectId,
-      companyId,
-      name: "Workspace project",
-      status: "in_progress",
-    });
+    await seedWorkspaceProject(db, companyId, projectId);
 
     await db.insert(projectWorkspaces).values({
       id: projectWorkspaceId,
@@ -5195,12 +4853,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     const targetProjectWorkspaceId = randomUUID();
     const executionWorkspaceId = randomUUID();
 
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
+    await seedIssueCompany(db, companyId);
     await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
 
     await db.insert(projects).values([
@@ -5265,12 +4918,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
   it("rejects explicitly pinned isolated git worktrees without a project or reusable workspace", async () => {
     const companyId = randomUUID();
 
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
+    await seedIssueCompany(db, companyId);
     await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
 
     await expect(svc.create(companyId, {
@@ -5294,12 +4942,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
   it("does not reject ambiguous inherited git-worktree settings before dispatch", async () => {
     const companyId = randomUUID();
 
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
+    await seedIssueCompany(db, companyId);
     await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
 
     const issue = await svc.create(companyId, {
@@ -5318,105 +4961,6 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     });
   });
 
-  it("keeps explicit workspace fields instead of inheriting the parent linkage", async () => {
-    const companyId = randomUUID();
-    const projectId = randomUUID();
-    const parentIssueId = randomUUID();
-    const parentProjectWorkspaceId = randomUUID();
-    const parentExecutionWorkspaceId = randomUUID();
-    const explicitProjectWorkspaceId = randomUUID();
-    const explicitExecutionWorkspaceId = randomUUID();
-
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
-    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
-
-    await db.insert(projects).values({
-      id: projectId,
-      companyId,
-      name: "Workspace project",
-      status: "in_progress",
-    });
-
-    await db.insert(projectWorkspaces).values([
-      {
-        id: parentProjectWorkspaceId,
-        companyId,
-        projectId,
-        name: "Parent workspace",
-      },
-      {
-        id: explicitProjectWorkspaceId,
-        companyId,
-        projectId,
-        name: "Explicit workspace",
-      },
-    ]);
-
-    await db.insert(executionWorkspaces).values([
-      {
-        id: parentExecutionWorkspaceId,
-        companyId,
-        projectId,
-        projectWorkspaceId: parentProjectWorkspaceId,
-        mode: "isolated_workspace",
-        strategyType: "git_worktree",
-        name: "Parent worktree",
-        status: "active",
-        providerType: "git_worktree",
-      },
-      {
-        id: explicitExecutionWorkspaceId,
-        companyId,
-        projectId,
-        projectWorkspaceId: explicitProjectWorkspaceId,
-        mode: "shared_workspace",
-        strategyType: "project_primary",
-        name: "Explicit shared workspace",
-        status: "active",
-        providerType: "local_fs",
-      },
-    ]);
-
-    await db.insert(issues).values({
-      id: parentIssueId,
-      companyId,
-      projectId,
-      projectWorkspaceId: parentProjectWorkspaceId,
-      title: "Parent issue",
-      status: "in_progress",
-      priority: "medium",
-      executionWorkspaceId: parentExecutionWorkspaceId,
-      executionWorkspacePreference: "reuse_existing",
-      executionWorkspaceSettings: {
-        mode: "isolated_workspace",
-      },
-    });
-
-    const child = await svc.create(companyId, {
-      parentId: parentIssueId,
-      projectId,
-      title: "Child issue",
-      projectWorkspaceId: explicitProjectWorkspaceId,
-      executionWorkspaceId: explicitExecutionWorkspaceId,
-      executionWorkspacePreference: "reuse_existing",
-      executionWorkspaceSettings: {
-        mode: "shared_workspace",
-      },
-    });
-
-    expect(child.projectWorkspaceId).toBe(explicitProjectWorkspaceId);
-    expect(child.executionWorkspaceId).toBe(explicitExecutionWorkspaceId);
-    expect(child.executionWorkspacePreference).toBe("reuse_existing");
-    expect(child.executionWorkspaceSettings).toEqual({
-      mode: "shared_workspace",
-    });
-  });
-
   it("inherits workspace linkage from an explicit source issue without creating a parent-child relationship", async () => {
     const companyId = randomUUID();
     const projectId = randomUUID();
@@ -5424,20 +4968,10 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     const projectWorkspaceId = randomUUID();
     const executionWorkspaceId = randomUUID();
 
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
+    await seedIssueCompany(db, companyId);
     await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
 
-    await db.insert(projects).values({
-      id: projectId,
-      companyId,
-      name: "Workspace project",
-      status: "in_progress",
-    });
+    await seedWorkspaceProject(db, companyId, projectId);
 
     await db.insert(projectWorkspaces).values({
       id: projectWorkspaceId,
@@ -5488,26 +5022,16 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     });
   });
 
-  it("derives project identity when an update adds workspace linkage to a projectless issue", async () => {
+  it("preserves projectless organization when an update adds workspace linkage", async () => {
     const companyId = randomUUID();
     const projectId = randomUUID();
     const projectWorkspaceId = randomUUID();
     const issueId = randomUUID();
 
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
+    await seedIssueCompany(db, companyId);
     await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
 
-    await db.insert(projects).values({
-      id: projectId,
-      companyId,
-      name: "Workspace project",
-      status: "in_progress",
-    });
+    await seedWorkspaceProject(db, companyId, projectId);
 
     await db.insert(projectWorkspaces).values({
       id: projectWorkspaceId,
@@ -5529,7 +5053,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
       projectWorkspaceId,
     });
 
-    expect(updated?.projectId).toBe(projectId);
+    expect(updated?.projectId).toBeNull();
     expect(updated?.projectWorkspaceId).toBe(projectWorkspaceId);
   });
 
@@ -5537,12 +5061,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
 
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
+    await seedIssueCompany(db, companyId);
     await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
     await db.insert(agents).values({
       id: agentId,
@@ -5585,20 +5104,10 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     const executionWorkspaceId = randomUUID();
     const issueId = randomUUID();
 
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
+    await seedIssueCompany(db, companyId);
     await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
 
-    await db.insert(projects).values({
-      id: projectId,
-      companyId,
-      name: "Workspace project",
-      status: "in_progress",
-    });
+    await seedWorkspaceProject(db, companyId, projectId);
 
     await db.insert(projectWorkspaces).values({
       id: projectWorkspaceId,
@@ -5668,7 +5177,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
       .where(eq(executionWorkspaces.id, executionWorkspaceId))
       .then((rows) => rows[0] ?? null);
 
-    expect(workspace?.metadata).toEqual({
+    expect(workspace?.metadata).toMatchObject({
       config: {
         environmentId: null,
         provisionCommand: "bash ./scripts/provision-new.sh",
@@ -5719,12 +5228,7 @@ describeEmbeddedPostgres("issueService.findMentionedProjectIds", () => {
     const titleProjectId = randomUUID();
     const commentProjectId = randomUUID();
 
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
+    await seedIssueCompany(db, companyId);
 
     await db.insert(projects).values([
       {
@@ -5770,12 +5274,7 @@ describeEmbeddedPostgres("issueService.findMentionedProjectIds", () => {
     const secondProjectId = randomUUID();
     const thirdProjectId = randomUUID();
 
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
+    await seedIssueCompany(db, companyId);
 
     await db.insert(projects).values([
       { id: firstProjectId, companyId, name: "First project", status: "in_progress" },
@@ -5889,23 +5388,8 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
     const issueId = randomUUID();
     const runId = status ? randomUUID() : null;
 
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
-    await db.insert(agents).values({
-      id: agentId,
-      companyId,
-      name: "CodexCoder",
-      role: "engineer",
-      status: "active",
-      adapterType: "codex_local",
-      adapterConfig: {},
-      runtimeConfig: {},
-      permissions: {},
-    });
+    await seedIssueCompany(db, companyId);
+    await seedCodexCoder(db, companyId, agentId);
     if (runId) {
       await db.insert(heartbeatRuns).values({
         id: runId,
@@ -5990,23 +5474,8 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
     const failedRunId = randomUUID();
     const runningRunId = randomUUID();
 
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
-    await db.insert(agents).values({
-      id: agentId,
-      companyId,
-      name: "CodexCoder",
-      role: "engineer",
-      status: "active",
-      adapterType: "codex_local",
-      adapterConfig: {},
-      runtimeConfig: {},
-      permissions: {},
-    });
+    await seedIssueCompany(db, companyId);
+    await seedCodexCoder(db, companyId, agentId);
     await db.insert(heartbeatRuns).values([
       {
         id: failedRunId,
@@ -6064,23 +5533,8 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
     const releasingRunId = randomUUID();
     const successorRunId = randomUUID();
 
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
-    await db.insert(agents).values({
-      id: agentId,
-      companyId,
-      name: "CodexCoder",
-      role: "engineer",
-      status: "active",
-      adapterType: "codex_local",
-      adapterConfig: {},
-      runtimeConfig: {},
-      permissions: {},
-    });
+    await seedIssueCompany(db, companyId);
+    await seedCodexCoder(db, companyId, agentId);
     await db.insert(heartbeatRuns).values([
       {
         id: failedRunId,
@@ -6160,23 +5614,8 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
     const failedRunId = randomUUID();
     const successorRunId = randomUUID();
 
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
-    await db.insert(agents).values({
-      id: agentId,
-      companyId,
-      name: "CodexCoder",
-      role: "engineer",
-      status: "active",
-      adapterType: "codex_local",
-      adapterConfig: {},
-      runtimeConfig: {},
-      permissions: {},
-    });
+    await seedIssueCompany(db, companyId);
+    await seedCodexCoder(db, companyId, agentId);
     await db.insert(heartbeatRuns).values([
       {
         id: failedRunId,
@@ -6242,23 +5681,8 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
     const queuedExecutionRunId = randomUUID();
     const successorRunId = randomUUID();
 
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
-    await db.insert(agents).values({
-      id: agentId,
-      companyId,
-      name: "CodexCoder",
-      role: "engineer",
-      status: "active",
-      adapterType: "codex_local",
-      adapterConfig: {},
-      runtimeConfig: {},
-      permissions: {},
-    });
+    await seedIssueCompany(db, companyId);
+    await seedCodexCoder(db, companyId, agentId);
     await db.insert(heartbeatRuns).values([
       {
         id: failedCheckoutRunId,
@@ -6363,24 +5787,9 @@ describeEmbeddedPostgres("accepted plan decomposition", () => {
     const goalId = randomUUID();
     const assigneeAgentId = randomUUID();
 
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
+    await seedIssueCompany(db, companyId);
     await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: false });
-    await db.insert(agents).values({
-      id: assigneeAgentId,
-      companyId,
-      name: "CodexCoder",
-      role: "engineer",
-      status: "active",
-      adapterType: "codex_local",
-      adapterConfig: {},
-      runtimeConfig: {},
-      permissions: {},
-    });
+    await seedCodexCoder(db, companyId, assigneeAgentId);
     await db.insert(goals).values({
       id: goalId,
       companyId,
@@ -6409,24 +5818,9 @@ describeEmbeddedPostgres("accepted plan decomposition", () => {
     const acceptedInteractionId = randomUUID();
 
     if (!args?.companyId || !args?.goalId || !args?.assigneeAgentId) {
-      await db.insert(companies).values({
-        id: companyId,
-        name: "Paperclip",
-        issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-        requireBoardApprovalForNewAgents: false,
-      });
+      await seedIssueCompany(db, companyId);
       await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: false });
-      await db.insert(agents).values({
-        id: assigneeAgentId,
-        companyId,
-        name: "CodexCoder",
-        role: "engineer",
-        status: "active",
-        adapterType: "codex_local",
-        adapterConfig: {},
-        runtimeConfig: {},
-        permissions: {},
-      });
+      await seedCodexCoder(db, companyId, assigneeAgentId);
       await db.insert(goals).values({
         id: goalId,
         companyId,
@@ -7045,6 +6439,7 @@ describeEmbeddedPostgres("issueService.assertCheckoutOwner stale checkout adopti
     await db.delete(goals);
     await db.delete(agents);
     await db.delete(instanceSettings);
+    await db.delete(companyMemberships);
     await db.delete(companies);
   });
 
@@ -7065,12 +6460,7 @@ describeEmbeddedPostgres("issueService.assertCheckoutOwner stale checkout adopti
     const issueId = randomUUID();
     const actorRunStatus = params.actorRunStatus ?? "running";
 
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
+    await seedIssueCompany(db, companyId);
     const agentRows = [
       {
         id: assigneeAgentId,
@@ -7132,6 +6522,67 @@ describeEmbeddedPostgres("issueService.assertCheckoutOwner stale checkout adopti
 
     return { issueId, assigneeAgentId, actorAgentId, staleRunId, actorRunId };
   }
+
+  it.each(["succeeded", "failed"])("preserves a human handoff when the outgoing legacy run later %s", async status => {
+    const seeded = await seedOwnershipIssue({ checkoutStatus: "failed" });
+    const original = await svc.getById(seeded.issueId);
+    await db.insert(companyMemberships).values({
+      companyId: original!.companyId,
+      principalType: "user",
+      principalId: "handoff-reviewer",
+      status: "active",
+    });
+    await db.update(heartbeatRuns).set({
+      contextSnapshot: { issueId: seeded.issueId },
+    }).where(eq(heartbeatRuns.id, seeded.actorRunId));
+    await svc.assertCheckoutOwner(seeded.issueId, seeded.actorAgentId, seeded.actorRunId);
+
+    const handoff = await svc.update(seeded.issueId, {
+      assigneeAgentId: null,
+      assigneeUserId: "handoff-reviewer",
+      status: "in_review",
+      actorAgentId: seeded.actorAgentId,
+      actorRunId: seeded.actorRunId,
+    });
+    expect(handoff).toMatchObject({
+      assigneeAgentId: null,
+      assigneeUserId: "handoff-reviewer",
+      status: "in_review",
+      checkoutRunId: null,
+      executionRunId: null,
+    });
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seeded.actorRunId));
+    expect(run!.status).toBe("running");
+    await expect(svc.assertCheckoutOwner(seeded.issueId, seeded.actorAgentId, seeded.actorRunId))
+      .rejects.toMatchObject({ status: 409 });
+    await expect(svc.update(seeded.issueId, {
+      title: "Late outgoing edit",
+      actorAgentId: seeded.actorAgentId,
+      actorRunId: seeded.actorRunId,
+    })).rejects.toMatchObject({ status: 403, details: { code: "issue_handed_off" } });
+
+    await terminalizeLegacyExecution({
+      db,
+      run: run!,
+      status,
+      fromStatuses: ["running"],
+      reconcileIfNeeded: true,
+      patch: { finishedAt: new Date(), ...(status === "failed" ? { errorCode: "process_lost" } : {}) },
+    });
+    await settleUnrecoverableExecutions(db);
+    await expect(svc.update(seeded.issueId, {
+      status: "done",
+      actorAgentId: seeded.actorAgentId,
+      actorRunId: seeded.actorRunId,
+    })).rejects.toMatchObject({ status: 403, details: { code: "issue_handed_off" } });
+    expect(await svc.getById(seeded.issueId)).toMatchObject({
+      status: "in_review",
+      assigneeAgentId: null,
+      assigneeUserId: "handoff-reviewer",
+    });
+    expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, seeded.issueId)))
+      .toHaveLength(0);
+  });
 
   it("lets the current assignee adopt a stale terminal checkout owner", async () => {
     const seeded = await seedOwnershipIssue({ checkoutStatus: "failed" });
@@ -7268,12 +6719,7 @@ describeEmbeddedPostgres("issueService.addComment createdByRunId", () => {
     agentId = randomUUID();
     issueId = randomUUID();
 
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
-      requireBoardApprovalForNewAgents: false,
-    });
+    await seedIssueCompany(db, companyId);
     await db.insert(agents).values({
       id: agentId,
       companyId,

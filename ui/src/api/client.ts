@@ -43,7 +43,7 @@ function applyObservabilityHeaders(headers: Headers) {
   }
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+export async function requestResponse(path: string, init?: RequestInit): Promise<Response> {
   const headers = new Headers(init?.headers ?? undefined);
   const body = init?.body;
   if (!(body instanceof FormData) && !headers.has("Content-Type")) {
@@ -52,9 +52,9 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   applyObservabilityHeaders(headers);
 
   const res = await fetch(`${BASE}${path}`, {
-    headers,
     credentials: "include",
     ...init,
+    headers,
   });
   if (!res.ok) {
     const errorBody = await readApiJson(res);
@@ -66,6 +66,11 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
       errorBody,
     );
   }
+  return res;
+}
+
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const res = await requestResponse(path, init);
   if (res.status === 204) return undefined as T;
   return readApiJson<T>(res);
 }
@@ -158,11 +163,6 @@ function coalescedGet<T>(path: string, options?: RequestOptions): Promise<T> {
  */
 export function detachInflightGet(path: string): void {
   inflightGets.delete(path);
-}
-
-/** Test-only: number of in-flight coalesced GET keys. */
-export function __inflightGetCount(): number {
-  return inflightGets.size;
 }
 
 function isRequestOptions(value: unknown): value is RequestOptions {

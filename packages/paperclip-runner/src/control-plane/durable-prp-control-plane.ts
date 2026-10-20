@@ -1,3 +1,4 @@
+import { configuredEnvironment } from "../configured-environment.js";
 import { spawn } from "node:child_process";
 import {
   createCipheriv,
@@ -29,13 +30,13 @@ import type { Duplex } from "node:stream";
 import { fileURLToPath } from "node:url";
 
 import { NativeSessionProtocolIntegrityError } from "../contracts/native-session-backend.js";
-import { ACPX_CREDENTIAL_BINDING_ENV, ACPX_CREDENTIAL_NAMES } from "../drivers/acpx/environment.js";
+import { ACPX_CREDENTIAL_BINDING_ENV, ACPX_CREDENTIAL_NAMES, CLAUDE_ROUTING_ENV_KEYS, createAcpxSidecarHostEnvironment } from "../drivers/acpx/environment.js";
+import { piCredentialNames } from "../drivers/acpx/pi-provider-config.js";
 import { githubCredentialEnvironment } from "../github-credential-environment.js";
 import {
   validatePrpEvent,
   type PrpEvent,
 } from "../protocol/replay-contract.js";
-import { digestPaperclipSemanticContent } from "../semantic-tools/receipts.js";
 import {
   type DurableRecoveryCommittedEvent,
   type DurableRecoveryCoreCommand,
@@ -45,20 +46,26 @@ import {
 
 const protocol = "paperclip.runner";
 const protocolMinVersion = 1;
-const protocolVersion = 2;
+const protocolVersion = 3;
 const secureFrameSchema = "paperclip.runner.secure-frame.v1";
 const websocketGuid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const coreStateSchema = "paperclip.runner.durable.control-plane-state.v1";
 const transitionCoreStateSchema =
   "paperclip.runner.durable.control-plane-state.warm-transition.v1";
 const maxFrameBytes = 1024 * 1024;
-const maxCommandBytes = maxFrameBytes - 4 * 1024;
+// Secure frames hex-encode ciphertext. Reserve envelope/tag space as well.
+const maxCommandBytes = Math.floor((maxFrameBytes - 4 * 1024) / 2);
 const maxCommands = 500;
+class CommandJournalLimitError extends Error {
+  constructor(readonly code: "command_payload_too_large" | "command_journal_full") {
+    super(`Durable PRP command journal bound exceeded: ${code}.`);
+  }
+}
 // A provider can emit several 100-event runner batches before the transport's
 // polling turn regains the event loop. Match the transport's explicit deferred
 // event bound so a valid burst is not compacted before it can be observed.
 const maxCommittedEventWindow = 4_096;
-const maxStateBytes = 192 * 1024 * 1024;
+const maxStateBytes = 256 * 1024 * 1024;
 const authChallengeTtlMs = 5_000;
 const stableIdPattern = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,239}$/;
 const runnerDigestPattern = /^sha256:[0-9a-f]{64}$/;
@@ -73,6 +80,7 @@ const commandTypes = new Set([
   "request.resolve",
   "interaction.receipt",
   "semantic_tool.result",
+  "external_provider.operation",
   "session.snapshot",
   "session.goal.get",
   "session.goal.set",
@@ -224,6 +232,13 @@ interface SecureChannel {
   sessionId: string;
 }
 
+/** Only the dispatch boundary may assert that no business operation started. */
+export class SemanticToolNotDispatchedError extends Error {
+  constructor() {
+    super("semantic_tool_not_dispatched");
+  }
+}
+
 export interface DurablePrpControlPlaneOptions {
   stateDirectory: string;
   identity: DurableRecoveryIdentity;
@@ -274,6 +289,7 @@ export interface RunnerProcessHandle {
   completion: Promise<RunnerProcessResult>;
   processGroupId?: number | null;
   startedAt?: string;
+  isExitConfirmed?(): boolean;
   /** Relaunches the same immutable process specification with a fresh ticket. */
   restart?(ticket: string): RunnerProcessHandle;
 }
@@ -401,6 +417,18 @@ export const durableRecoveryInternals = Object.freeze({ canonicalJson });
 
 function canonicalDigest(value: unknown): string {
   return createHash("sha256").update(canonicalJson(value)).digest("hex");
+}
+
+function matchesSemanticInputDigest(input: unknown, digest: unknown): boolean {
+  try {
+    // Wire integrity covers the complete input, including protected fields.
+    // Receipt redaction can erase those differences and has a separate hash.
+    return digest === `sha256:${canonicalDigest(input)}`;
+  } catch {
+    // Canonicalization bounds must keep the same permanent integrity fence.
+    // Never attach an input-derived error or payload to the diagnostic.
+    return false;
+  }
 }
 
 function exactIdentity(value: unknown): value is DurableRecoveryIdentity {
@@ -586,7 +614,11 @@ function unsettledSemanticInput(
       command.payload.sourceEventType !== event.eventType ||
       canonicalJson(command.payload.correlation) !==
         canonicalJson(expectedCorrelation) ||
-      canonicalJson(command.payload.input) !== canonicalJson(semantic.input)
+      (command.payload.inputDigest === undefined
+        ? canonicalJson(command.payload.input) !== canonicalJson(semantic.input)
+        : command.payload.inputDigest !== canonicalDigest(semantic.input)
+          || (command.payload.input !== undefined
+            && canonicalJson(command.payload.input) !== canonicalJson(semantic.input)))
     );
   } catch {
     // Malformed retained evidence cannot establish settled authority, and
@@ -672,7 +704,7 @@ function isStoredCoreState(
       (command, index) =>
         isRecord(command) &&
         (command.schema === "paperclip.prp.command.v1" ||
-          command.schema === "paperclip.prp.command.v2") &&
+          command.schema === "paperclip.prp.command.v2" || command.schema === "paperclip.prp.command.v3") &&
         typeof command.commandId === "string" &&
         stableIdPattern.test(command.commandId) &&
         command.commandId.length <= 160 &&
@@ -1461,9 +1493,20 @@ export class DurablePrpControlPlane {
   #expectedRunnerDigest: string;
   #server: Server | null = null;
   #connections = new Set<AuthorityConnection>();
+  #eventOwner: AuthorityConnection | null = null;
+  // Set when the last authenticated Runner connection closes; cleared on the
+  // next authentication. Diagnostic only: it never gates authority.
+  #runnerDisconnectedAt: number | null = null;
   #connectionProcessing = new Map<AuthorityConnection, Promise<void>>();
   #pendingSemanticCalls = new Set<string>();
+  #semanticCallbacksRetired = false;
   #semanticResultPersistenceFailed = false;
+  #semanticResultFailures: Array<{
+    callId: string;
+    operationId: string;
+    stage: "persist_result" | "dispatch";
+    code: string;
+  }> = [];
   #port: number | null = null;
   #onSemanticToolInput?: DurablePrpControlPlaneOptions["onSemanticToolInput"];
   #onCommittedEvent?: DurablePrpControlPlaneOptions["onCommittedEvent"];
@@ -1593,6 +1636,16 @@ export class DurablePrpControlPlane {
     }
   }
 
+  /** Retire this journal writer after stopped ingress is fully joined. A late
+   * external effect keeps its committed input pending for reconciliation;
+   * it must never overwrite the successor controller's durable state. */
+  retireSemanticToolCallbacks(): void {
+    if (this.#server !== null || this.#connections.size !== 0 || this.#connectionProcessing.size !== 0) {
+      throw new Error("Semantic callback retirement requires drained, stopped ingress.");
+    }
+    this.#semanticCallbacksRetired = true;
+  }
+
   /** Forces a resumable re-authentication after an immutable run attachment rotates. */
   disconnectActiveRunner(): void {
     const connections = [...this.#connections];
@@ -1604,6 +1657,15 @@ export class DurablePrpControlPlane {
     return [...this.#connections].filter(
       (connection) => connection.secureChannel !== null,
     ).length;
+  }
+
+  /**
+   * Milliseconds since the last authenticated Runner connection closed, or
+   * null when a Runner is connected or has never authenticated.
+   */
+  runnerDisconnectedForMs(now = Date.now()): number | null {
+    if (this.#runnerDisconnectedAt === null || this.activeRunnerConnectionCount() > 0) return null;
+    return Math.max(0, now - this.#runnerDisconnectedAt);
   }
 
   /** A reusable close requires every admitted callback's exact durable result. */
@@ -1620,6 +1682,36 @@ export class DurablePrpControlPlane {
         unsettledSemanticInput(event, this.#store.state),
       )
     );
+  }
+
+  /** Safe run-log evidence: identities and delivery state, never tool contents. */
+  semanticToolSettlementDiagnostics(): Record<string, unknown> {
+    const pending = this.#store.state.committedEvents.filter((event) =>
+      unsettledSemanticInput(event, this.#store.state),
+    );
+    return {
+      persistenceFailed: this.#semanticResultPersistenceFailed,
+      failures: this.#semanticResultFailures,
+      pending: pending.map((entry) => {
+        const event = entry.envelope.payload as Record<string, unknown>;
+        const payload = event.payload as Record<string, unknown>;
+        const tool = payload.semantic_tool as Record<string, unknown>;
+        return {
+          sourceEventId: entry.sourceEventId,
+          callId: tool.callId,
+          operationId: tool.operationId,
+          inputDigest: canonicalDigest(tool.input),
+        };
+      }),
+      deliveries: this.#store.state.commands
+        .filter((command) => command.type === "semantic_tool.result" && command.status !== "completed")
+        .map((command) => ({
+          commandId: command.commandId,
+          callId: command.payload.callId,
+          operationId: command.payload.operationId,
+          status: command.status,
+        })),
+    };
   }
 
   /**
@@ -1895,7 +1987,7 @@ export class DurablePrpControlPlane {
     }
     const controllerSeq = this.#store.state.commands.length + 1;
     const command: DurableRecoveryCoreCommand = {
-      schema: type.startsWith("session.goal.")
+      schema: type === "external_provider.operation" ? "paperclip.prp.command.v3" : type.startsWith("session.goal.")
         ? "paperclip.prp.command.v2"
         : "paperclip.prp.command.v1",
       commandId:
@@ -1907,12 +1999,10 @@ export class DurablePrpControlPlane {
       status: "pending",
       result: null,
     };
-    if (
-      this.#store.state.commands.length >= maxCommands ||
-      Buffer.byteLength(JSON.stringify(command)) > maxCommandBytes
-    ) {
-      throw new Error("Durable PRP command journal bound exceeded.");
-    }
+    if (this.#store.state.commands.length >= maxCommands)
+      throw new CommandJournalLimitError("command_journal_full");
+    if (Buffer.byteLength(JSON.stringify(command)) > maxCommandBytes)
+      throw new CommandJournalLimitError("command_payload_too_large");
     this.#store.state.commands.push(command);
     this.#store.save();
     if (deliverImmediately) {
@@ -2008,7 +2098,11 @@ export class DurablePrpControlPlane {
         };
         void tail.then(release, release);
       },
-      onClose: () => this.#connections.delete(connection),
+      onClose: () => {
+        this.#connections.delete(connection);
+        if (connection.secureChannel !== null && this.activeRunnerConnectionCount() === 0)
+          this.#runnerDisconnectedAt ??= Date.now();
+      },
     });
     this.#connections.add(connection);
     return {
@@ -2670,6 +2764,8 @@ export class DurablePrpControlPlane {
       pending.serverProof,
       clientProof,
     );
+    this.#runnerDisconnectedAt = null;
+    this.#eventOwner = connection;
     for (const active of this.#connections) {
       if (active !== connection && active.secureChannel !== null)
         active.close();
@@ -3010,6 +3106,8 @@ export class DurablePrpControlPlane {
     connection: AuthorityConnection,
     envelope: Record<string, unknown>,
   ): Promise<void> {
+    if (this.#eventOwner !== connection) return;
+    const identity = this.#identity;
     if (this.#protocolIntegrityError !== null) {
       connection.close();
       return;
@@ -3090,8 +3188,10 @@ export class DurablePrpControlPlane {
     if (
       isSemanticInput &&
       semantic !== undefined &&
-      (semantic.content as Record<string, unknown>).digest !==
-        digestPaperclipSemanticContent(semantic.input)
+      !matchesSemanticInputDigest(
+        semantic.input,
+        (semantic.content as Record<string, unknown>).digest,
+      )
     ) {
       // Only the authenticated, schema-valid, exactly correlated input may
       // permanently fail its owner. Never commit, dispatch, or ACK these bytes.
@@ -3140,6 +3240,7 @@ export class DurablePrpControlPlane {
     try {
       await this.#onCommittedEvent?.(event);
     } catch (error) {
+      if (this.#eventOwner !== connection || this.#identity !== identity) return;
       if (error instanceof NativeSessionProtocolIntegrityError) {
         this.#failProtocolIntegrity(connection, error);
       } else {
@@ -3147,6 +3248,7 @@ export class DurablePrpControlPlane {
       }
       return;
     }
+    if (this.#eventOwner !== connection || this.#identity !== identity) return;
     // Another authenticated connection can replace this one while its commit
     // is in flight. Once that exact owner has faulted, even a prior successful
     // commit cannot reopen delivery or invoke a new business operation.
@@ -3215,31 +3317,61 @@ export class DurablePrpControlPlane {
       const alreadyQueued = this.#store.state.commands.some(
         (command) => command.commandId === commandId,
       );
-      if (!alreadyQueued && !this.#pendingSemanticCalls.has(commandId)) {
+      // A committed input without a result after restart may already have
+      // changed the outside world. Never redispatch it on event replay. Only
+      // the original admitted callback may publish its result; missing outcome
+      // evidence stays pending for authoritative reconciliation.
+      if (existing === undefined && !alreadyQueued && !this.#pendingSemanticCalls.has(commandId)) {
         this.#pendingSemanticCalls.add(commandId);
+        const recordFailure = (stage: "persist_result" | "dispatch", error: unknown) => {
+          this.#semanticResultPersistenceFailed = true;
+          // Keep diagnostics bounded and content-free. Exception messages can
+          // contain tool bodies or credentials; retain only known error codes.
+          const storageCode = error && typeof error === "object" && "code" in error ? error.code : null;
+          const code = error instanceof CommandJournalLimitError ? error.code
+            : typeof storageCode === "string" && ["ENOSPC", "EDQUOT", "EACCES", "EPERM", "EIO", "EROFS"].includes(storageCode)
+              ? storageCode : stage === "dispatch" ? "dispatcher_rejected" : "result_persistence_failed";
+          this.#semanticResultFailures.push({ callId: call.callId, operationId: call.operationId, stage, code });
+          this.#semanticResultFailures = this.#semanticResultFailures.slice(-20);
+          this.disconnectActiveRunner();
+        };
         const queueResult = (result: unknown, isError: boolean): void => {
+          if (this.#semanticCallbacksRetired) return;
           try {
+            // Retain the full input once in its canonical event. Copying a
+            // large write into its result command can exceed the wire bound
+            // after the write has already committed. Bind it by exact digest.
+            const { input, ...metadata } = call;
             this.queueCommand(
               "semantic_tool.result",
-              { ...call, result, isError },
+              { ...metadata, inputDigest: canonicalDigest(input), result, isError },
               commandId,
               true,
             );
-          } catch {
-            this.#semanticResultPersistenceFailed = true;
+          } catch (error) {
             // A result that cannot fit the bounded durable journal cannot be
             // acknowledged as a usable tool response. Force a reconnect so
             // the caller can recover or terminate the run explicitly.
-            this.disconnectActiveRunner();
+            recordFailure("persist_result", error);
           }
         };
         void this.#onSemanticToolInput(call)
           .then((outcome) =>
             queueResult(outcome.result, outcome.isError === true),
           )
-          .catch(() =>
-            queueResult({ code: "semantic_tool_bridge_failed" }, true),
-          )
+          .catch((error: unknown) => {
+            if (error instanceof SemanticToolNotDispatchedError) {
+              queueResult({ error: {
+                code: "semantic_tool_not_dispatched",
+                retryable: false,
+                message: "The turn stopped before this operation was dispatched.",
+              } }, true);
+              return;
+            }
+            // A rejected dispatcher promise does not prove that its effect
+            // rolled back. Do not fabricate a final failure or retry the write.
+            recordFailure("dispatch", error);
+          })
           .finally(() => this.#pendingSemanticCalls.delete(commandId));
       }
     }
@@ -3278,7 +3410,14 @@ const runnerPlatformEnvironmentKeys = [
 ] as const;
 
 const runnerExplicitProviderEnvironmentKeys = [
-  ...ACPX_CREDENTIAL_NAMES.pi,
+  ...ACPX_CREDENTIAL_NAMES.claude.filter(name => !name.startsWith("AWS_")),
+  ...CLAUDE_ROUTING_ENV_KEYS,
+  "PAPERCLIP_AI_PROVIDER_KEY",
+  "PAPERCLIP_AI_PROVIDER_URL",
+  "PAPERCLIP_AGENT_KEY_ID",
+  "PAPERCLIP_AGENT_PUBLIC_KEY",
+  "PAPERCLIP_AGENT_PRIVATE_KEY",
+  ...ACPX_CREDENTIAL_NAMES.pi.filter(name => !name.startsWith("AWS_")),
   ...ACPX_CREDENTIAL_NAMES.cursor,
   ...ACPX_CREDENTIAL_NAMES.copilot,
   ACPX_CREDENTIAL_BINDING_ENV,
@@ -3305,8 +3444,16 @@ const runnerExplicitProviderEnvironmentKeys = [
   "PAPERCLIP_NATIVE_MCP_NAME",
   "PAPERCLIP_NATIVE_MCP_URL",
   "PAPERCLIP_NATIVE_MCP_TOKEN",
+  "PAPERCLIP_NATIVE_MCP_STDIO",
+  "PAPERCLIP_NATIVE_MCP_PROXY",
   "PAPERCLIP_NATIVE_RUNTIME_CONTEXT_PATH",
   "PAPERCLIP_RUNNER_EXTERNAL_SANDBOX",
+  "PAPERCLIP_RUNNER_HOME_MODE",
+  "ACPX_CLAUDE_INCLUDE_USER_SETTINGS",
+  "CLAUDE_CONFIG_DIR",
+  "XDG_CONFIG_HOME",
+  "XDG_DATA_HOME",
+  "XDG_CACHE_HOME",
   "PAPERCLIP_ACPX_BUILTIN_ROOT",
   "PAPERCLIP_ACPX_PROVIDER_PACKAGE_ROOT",
   "PAPERCLIP_ACPX_PROVIDER_PACKAGE_MANIFEST",
@@ -3317,6 +3464,7 @@ const runnerExplicitProviderEnvironmentKeys = [
 
 function runnerEnvironment(
   ticket: string,
+  normalizedSessionId: string,
   explicitSource?: NodeJS.ProcessEnv,
 ): NodeJS.ProcessEnv {
   const platformSource = explicitSource ?? process.env;
@@ -3335,7 +3483,28 @@ function runnerEnvironment(
       const value = explicitSource[key];
       if (value !== undefined) environment[key] = value;
     }
-    Object.assign(environment, githubCredentialEnvironment(explicitSource));
+    if (explicitSource.CLAUDE_CODE_USE_BEDROCK === "1") {
+      for (const key of ["AWS_BEARER_TOKEN_BEDROCK"] as const) {
+        if (explicitSource[key] !== undefined) environment[key] = explicitSource[key];
+      }
+    }
+    // Pi custom-provider references and direct cloud credentials cross only
+    // under the controller's exact run/session credential binding.
+    const marker = explicitSource[ACPX_CREDENTIAL_BINDING_ENV];
+    let binding: unknown;
+    if (marker !== undefined && Buffer.byteLength(marker) <= 4_096) {
+      try { binding = JSON.parse(marker); } catch { /* Sidecar admission rejects invalid markers. */ }
+    }
+    let taskEnvironmentSource = explicitSource;
+    if (binding !== null && typeof binding === "object" && !Array.isArray(binding)
+      && (binding as Record<string, unknown>).agent === "pi") {
+      const bound = createAcpxSidecarHostEnvironment(explicitSource, "pi", normalizedSessionId);
+      taskEnvironmentSource = bound;
+      for (const key of piCredentialNames(explicitSource)) {
+        if (bound[key] !== undefined) environment[key] = bound[key];
+      }
+    }
+    Object.assign(environment, githubCredentialEnvironment(explicitSource), configuredEnvironment(taskEnvironmentSource));
   }
   return environment;
 }
@@ -3483,10 +3652,15 @@ export function spawnRunner(options: {
   }
 
   const command = options.runnerBinaryPath ?? runnerBinary;
-  const environment = runnerEnvironment(options.ticket, options.environment);
+  const environment = runnerEnvironment(options.ticket, options.identity.normalizedSessionId, options.environment);
   const withRestart = (handle: RunnerProcessHandle): RunnerProcessHandle => ({
     ...handle,
-    restart: (ticket) => spawnRunner({ ...options, ticket }),
+    restart: (ticket) => {
+      if (handle.isExitConfirmed?.() === false) {
+        throw new Error("runner_process_termination_unconfirmed");
+      }
+      return spawnRunner({ ...options, ticket });
+    },
   });
   if (options.processLauncher !== undefined) {
     return withRestart(
@@ -3571,7 +3745,7 @@ export async function waitForProcess(
 ): Promise<RunnerProcessResult> {
   let timer: NodeJS.Timeout | undefined;
   try {
-    return await Promise.race([
+    const result = await Promise.race([
       handle.completion,
       new Promise<never>((_resolve, reject) => {
         timer = setTimeout(() => {
@@ -3592,6 +3766,10 @@ export async function waitForProcess(
         }, timeoutMs);
       }),
     ]);
+    if (handle.isExitConfirmed?.() === false) {
+      throw new Error("runner_process_termination_unconfirmed");
+    }
+    return result;
   } finally {
     if (timer !== undefined) clearTimeout(timer);
   }

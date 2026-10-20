@@ -33,17 +33,8 @@ const claudePatch = await readFile(
   ),
   "utf8",
 );
-const qualifiedProfiles = await readFile(
-  new URL("../src/drivers/acpx/qualified-profiles.ts", import.meta.url),
-  "utf8",
-);
-const runnerdAcpxBackend = await readFile(
-  new URL(
-    "../runner/crates/runner-core/src/acpx_provider_backend.rs",
-    import.meta.url,
-  ),
-  "utf8",
-);
+const profiles = JSON.parse(await readFile(new URL("../acpx-profiles.json", import.meta.url), "utf8"));
+const runnerdProfiles = await readFile(new URL("../runner/crates/runner-core/src/generated_acpx_profiles.rs", import.meta.url), "utf8");
 const providerPackBuilder = await readFile(
   new URL("../scripts/build-provider-pack.mjs", import.meta.url),
   "utf8",
@@ -59,11 +50,15 @@ const nativeSessionExecutor = await readFile(
 test("the runner pins every qualified ACPX production dependency", () => {
   assert.equal(runnerPackage.dependencies["@openai/codex"], "0.156.1");
   assert.equal(runnerPackage.dependencies["@anthropic-ai/claude-agent-sdk"], undefined);
-  // codex-acp 1.13.1 depends on @openai/codex ^0.156.1, which already resolves
-  // to the runner's exact 0.156.1 pin, so no codex-acp override remains.
-  assert.equal(rootPackage.pnpm.overrides["@agentclientprotocol/codex-acp@1.6.2>@openai/codex"], undefined);
-  assert.equal(rootPackage.pnpm.overrides["@agentclientprotocol/claude-agent-acp@0.73.0>@anthropic-ai/claude-agent-sdk"], "0.3.280");
-  assert.equal(runnerPackage.optionalDependencies, undefined);
+  // codex-acp 1.13.1's nested @openai/codex is pinned to the exact qualified
+  // 0.156.1 runtime (bundled-provider gate requires the override entry).
+  assert.equal(rootPackage.pnpm.overrides["@agentclientprotocol/codex-acp@1.13.1>@openai/codex"], "0.156.1");
+  assert.equal(rootPackage.pnpm.overrides["@agentclientprotocol/claude-agent-acp@0.73.0>@anthropic-ai/claude-agent-sdk"], "0.3.286");
+  assert.deepEqual(runnerPackage.optionalDependencies, {
+    "@github/copilot-darwin-arm64": "1.0.88",
+    "@github/copilot-darwin-x64": "1.0.88",
+    "@github/copilot-linux-x64": "1.0.88",
+  });
   assert.equal(runnerPackage.dependencies.node, undefined);
   assert.equal(runnerPackage.dependencies.acpx, "0.13.1");
   assert.equal(
@@ -77,29 +72,16 @@ test("the runner pins every qualified ACPX production dependency", () => {
 });
 
 test("the patched Codex ACP executable digest stays aligned across launch boundaries", async () => {
-  const profileMatch =
-    /agent: "codex"[\s\S]*?commandDigest:\s*"(sha256:[a-f0-9]{64})"/.exec(
-      qualifiedProfiles,
-    );
-  assert.ok(profileMatch, "qualified Codex ACPX profile digest");
-  const digest = profileMatch[1];
+  const digest = profiles.profiles.codex.commandDigest;
   const packagePath = createRequire(import.meta.url).resolve("@agentclientprotocol/codex-acp/package.json");
   const installed = JSON.parse(await readFile(packagePath, "utf8"));
   const executable = await readFile(resolve(dirname(packagePath), installed.bin["codex-acp"]));
   assert.equal(digest, `sha256:${createHash("sha256").update(executable).digest("hex")}`,
     "the identity binds installed executable bytes, not the patch file");
 
-  assert.match(runnerdAcpxBackend, new RegExp(`"codex"[\\s\\S]*?${digest}`));
-  assert.match(
-    providerPackBuilder,
-    new RegExp(`acpxProfileDigests:[\\s\\S]*?codex:[\\s\\S]*?${digest}`),
-  );
-  assert.match(
-    nativeSessionExecutor,
-    new RegExp(
-      `REMOTE_PROVIDER_PACK_PROFILE_DIGESTS[\\s\\S]*?codex:[\\s\\S]*?${digest}`,
-    ),
-  );
+  assert.match(runnerdProfiles, new RegExp(`"codex"[\\s\\S]*?${digest}`));
+  assert.match(providerPackBuilder, /codex:\s*profiles\.profiles\.codex\.commandDigest/);
+  assert.match(nativeSessionExecutor, /codex:\s*QUALIFIED_ACPX_PROFILES\.codex\.commandDigest/);
 });
 
 test("the package exposes only the reviewed runner CLI binaries", () => {

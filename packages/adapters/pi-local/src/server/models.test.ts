@@ -1,3 +1,6 @@
+import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const { runChildProcessMock } = vi.hoisted(() => ({
@@ -13,7 +16,6 @@ vi.mock("@paperclipai/adapter-utils/server-utils", async () => {
     runChildProcess: runChildProcessMock,
   };
 });
-
 import {
   discoverPiModelsCached,
   ensurePiModelConfiguredAndAvailable,
@@ -301,5 +303,45 @@ describe("pi models discovery", () => {
     await expect(
       listPiModels({ command: "__paperclip_missing_pi_command__" }),
     ).resolves.toEqual([]);
+  });
+  it("does not embed the model catalogue when the configured model is unavailable", async () => {
+    // This suite mocks runChildProcess; this case needs the real spawn path.
+    const actual = await vi.importActual<
+      typeof import("@paperclipai/adapter-utils/server-utils")
+    >("@paperclipai/adapter-utils/server-utils");
+    runChildProcessMock.mockImplementation((...args: Parameters<typeof actual.runChildProcess>) =>
+      actual.runChildProcess(...args),
+    );
+    try {
+    const directory = await mkdtemp(join(tmpdir(), "paperclip-pi-models-"));
+    const command = join(directory, "pi");
+    const modelIds = Array.from({ length: 13 }, (_, index) => `provider/model-${index}`);
+    await writeFile(
+      command,
+      `#!/bin/sh\nprintf 'provider  model\\n';\n${modelIds
+        .map((id) => {
+          const [provider, model] = id.split("/");
+          return `printf '${provider}  ${model}\\n'`;
+        })
+        .join(";\n")}\n`,
+    );
+    await chmod(command, 0o755);
+
+    try {
+      await expect(
+        ensurePiModelConfiguredAndAvailable({
+          command,
+          model: "provider/missing",
+        }),
+      ).rejects.toMatchObject({
+        message:
+          "Configured Pi model is unavailable: provider/missing. 13 models are available; list them with `pi --list-models`.",
+      });
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+    } finally {
+      runChildProcessMock.mockReset();
+    }
   });
 });

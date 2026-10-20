@@ -1,3 +1,5 @@
+import { subscribeDatabaseWork } from "@paperclipai/db";
+import { DELIVERY_QUEUES } from "../services/delivery-work-notifications.js";
 import { createHmac, randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
@@ -214,6 +216,40 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     return { companyId, agentId, issueSvc, projectId, routine, svc, wakeups };
   }
 
+  it("notifies scheduled routine work after trigger transactions settle", async () => {
+    const f = await seedFixture();
+    const events: string[] = [];
+    const unsubscribe = subscribeDatabaseWork(db, DELIVERY_QUEUES.routineSchedules, event => { events.push(event); });
+    try {
+      const created = await f.svc.createTrigger(f.routine.id,
+        { kind: "schedule", cronExpression: "0 * * * *", timezone: "UTC" }, {});
+      expect(events).toEqual(["intent", "settled"]);
+      events.length = 0;
+      await f.svc.updateTrigger(created.trigger.id, { cronExpression: "30 * * * *" }, {});
+      expect(events).toEqual(["intent", "settled"]);
+      events.length = 0;
+      await f.svc.deleteTrigger(created.trigger.id, {});
+      expect(events).toEqual(["intent", "settled"]);
+    } finally { unsubscribe(); }
+  });
+
+  it("notifies monitor work when an issue deadline is created and changed", async () => {
+    const f = await seedFixture();
+    const events: string[] = [];
+    const unsubscribe = subscribeDatabaseWork(db, DELIVERY_QUEUES.issueMonitors, event => { events.push(event); });
+    const next = new Date(Date.now() + 600_000);
+    try {
+      const issue = await f.issueSvc.create(f.companyId, {
+        title: "Scheduled check", status: "in_progress", assigneeAgentId: f.agentId,
+        executionPolicy: { mode: "normal", commentRequired: true, stages: [], monitor: { nextCheckAt: next.toISOString() } },
+      });
+      expect(events).toEqual(["intent", "settled"]);
+      events.length = 0;
+      await f.issueSvc.update(issue.id, { monitorNextCheckAt: new Date(next.getTime() + 60_000) });
+      expect(events).toEqual(["intent", "settled"]);
+    } finally { unsubscribe(); }
+  });
+
   async function armWorktreeExecution(cutoff: Date, instanceId = "worktree-routines-test") {
     await db.insert(instanceSettings).values({
       singletonKey: "default",
@@ -245,6 +281,63 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
       .returning()
       .then((rows) => rows[0]!);
   }
+
+  it("rejects malformed routine and trigger IDs before any query", async () => {
+    const { routine, svc } = await seedFixture();
+    const malformed = [
+      "", routine.id.slice(0, 8), "not-a-uuid", `${routine.id} `, ` ${routine.id}`,
+      `${routine.id}\n`, `{${routine.id}`, `${routine.id}}`, `{${routine.id}\n}`,
+      `${routine.id}-`, routine.id.replace("-", "--"), `g${routine.id.slice(1)}`,
+      `${routine.id}\0`, `é${routine.id.slice(1)}`,
+      `${routine.id.slice(0, 3)}-${routine.id.slice(3)}`,
+    ];
+    const select = vi.spyOn(db, "select");
+    try {
+      for (const id of malformed) {
+        await expect(svc.get(id)).resolves.toBeNull();
+        await expect(svc.getDetail(id)).resolves.toBeNull();
+        await expect(svc.getTrigger(id)).resolves.toBeNull();
+      }
+      expect(select).not.toHaveBeenCalled();
+    } finally {
+      select.mockRestore();
+    }
+  });
+
+  it("preserves lookup failures for valid routine and trigger IDs", async () => {
+    const { routine, svc } = await seedFixture();
+    const failure = new Error("Database unavailable");
+    const select = vi.spyOn(db, "select").mockImplementation(() => { throw failure; });
+    try {
+      await expect(svc.get(routine.id)).rejects.toBe(failure);
+      await expect(svc.getDetail(routine.id)).rejects.toBe(failure);
+      await expect(svc.getTrigger(routine.id)).rejects.toBe(failure);
+    } finally {
+      select.mockRestore();
+    }
+  });
+
+  it.each([
+    "12345678-1234-4234-8234-123456789abc",
+    "12345678-1234-7234-8234-123456789abc",
+    "00000000-0000-0000-0000-000000000000",
+    "ffffffff-ffff-ffff-ffff-ffffffffffff",
+  ])("preserves PostgreSQL UUID lookup forms for %s", async (id) => {
+    const { companyId, svc } = await seedFixture();
+    await db.insert(routines).values({ id, companyId, title: "UUID lookup fixture" });
+    await db.insert(routineTriggers).values({ id, companyId, routineId: id, kind: "api" });
+    const compact = id.replaceAll("-", "");
+    const forms = [
+      id, id.toUpperCase(), `{${id}}`, compact,
+      compact.match(/.{4}/g)!.join("-"),
+      `{${compact.slice(0, 8)}-${compact.slice(8, 16)}-${compact.slice(16)}}`,
+    ];
+    for (const input of forms) {
+      await expect(svc.get(input)).resolves.toMatchObject({ id, companyId });
+      await expect(svc.getDetail(input)).resolves.toMatchObject({ id, companyId });
+      await expect(svc.getTrigger(input)).resolves.toMatchObject({ id, companyId, routineId: id });
+    }
+  });
 
   it("clears transient routine run failures when execution issues resume", async () => {
     const { companyId, issueSvc, routine, svc } = await seedFixture();

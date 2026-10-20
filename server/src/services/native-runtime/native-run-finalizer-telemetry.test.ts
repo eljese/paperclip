@@ -1,3 +1,4 @@
+import { enableRunFailureReporting } from "../../__tests__/helpers/run-failure-reporting.js";
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
@@ -12,6 +13,7 @@ import {
   nativeRunFinalizations,
   nativeRunResults,
   workAssessments,
+  statusDecisions,
   issueRecoveryActions,
   agentWakeupRequests,
   workspaceOperations,
@@ -56,6 +58,7 @@ import { restoreNativeWorkspaceBestEffort } from "./native-workspace-best-effort
 import { reconcileNativeFinalizations } from "./native-finalization-reconciler.js";
 import { recoverLegacyUnsafeWorkspaceExports } from "./native-workspace-export-recovery.js";
 import { finalizeNativeRun, recordNativeFinalizationFailure } from "./native-run-finalizer.js";
+import { waitForPendingRunFailureReports } from "../run-failure-report.js";
 import { deliverExecutionStatuses } from "../execution-status-delivery.js";
 import { commitNativeStatusDecision } from "./status-decision-committer.js";
 import { NATIVE_STATUS_ARBITER_POLICY_VERSION, type NativeStatusDecision } from "./status-arbiter.js";
@@ -183,6 +186,42 @@ describeEmbeddedPostgres("native run finalizer / status decision committer — a
       callerResultId: `${fixture.runId}:result`,
     });
   }
+
+  it("finishes an accepted result after shutdown failed and workspace repair succeeded", async () => {
+    const fixture = await seedNativeRun();
+    await db.update(completionContracts).set({ risk: "low", completionAuthority: "agent_claim_policy",
+      contractJson: { revision: CONTROL_PLANE_CONFORMANCE_RESULT.completionClaim.contractRevision,
+        objective: "Finish the work", criteria: [{ id: "objective", requirement: "Complete the task" }] } })
+      .where(eq(completionContracts.id, fixture.contractId));
+    await driveToCompleteResult(fixture);
+    await db.update(heartbeatRuns).set({ status: "failed", finishedAt: new Date(),
+      errorCode: "provider_transport_failed", error: "provider_transport_failed: runner did not durably suspend before checkpoint" })
+      .where(eq(heartbeatRuns.id, fixture.runId));
+    await db.update(nativeRunFinalizations).set({ phase: "retryable_failure", leaseOwner: null,
+      leaseExpiresAt: null, nextAttemptAt: null }).where(eq(nativeRunFinalizations.runId, fixture.runId));
+    const failed = await finalizeNativeRun({ db, runId: fixture.runId, workspaceFinalizeStatus: "failed" });
+    // An unchanged failed workspace must replay its existing decision.
+    await finalizeNativeRun({ db, runId: fixture.runId, workspaceFinalizeStatus: "failed" });
+    expect(await db.select().from(statusDecisions).where(eq(statusDecisions.runId, fixture.runId))).toHaveLength(1);
+    await db.insert(workspaceOperations).values({ companyId, issueId: fixture.issueId,
+      heartbeatRunId: fixture.runId, phase: "workspace_finalize", status: "succeeded" });
+    await db.update(nativeRunFinalizations).set({ nextAttemptAt: null }).where(eq(nativeRunFinalizations.runId, fixture.runId));
+    await reconcileNativeFinalizations(db, [fixture.runId]);
+    expect((await db.select().from(issues).where(eq(issues.id, fixture.issueId)))[0]).toMatchObject({
+      status: "done", executionRunId: null, checkoutRunId: null,
+    });
+    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, fixture.runId)))[0]).toMatchObject({
+      status: "succeeded", errorCode: null, error: null,
+      resultJson: { recoveredExecutionFailure: { errorCode: "provider_transport_failed" } },
+    });
+    const assessments = await db.select().from(workAssessments).where(eq(workAssessments.runId, fixture.runId));
+    expect(assessments).toHaveLength(2);
+    expect(assessments.find(row => row.id !== failed.assessmentId)?.supersedesAssessmentId).toBe(failed.assessmentId);
+    await reconcileNativeFinalizations(db, [fixture.runId]);
+    expect(await db.select().from(statusDecisions).where(eq(statusDecisions.runId, fixture.runId))).toHaveLength(2);
+    expect(await db.select().from(nativeRunResults).where(eq(nativeRunResults.runId, fixture.runId))).toHaveLength(1);
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId))).toHaveLength(0);
+  });
 
   it("emits exactly one agent.task_run event when the native finalizer commits a terminal status", async () => {
     const fixture = await seedNativeRun();
@@ -515,6 +554,34 @@ describeEmbeddedPostgres("native run finalizer / status decision committer — a
     await finalize();
     const [replayed] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, fixture.runId));
     expect(replayed).toEqual(repaired);
+  });
+
+  it("reports a committed failure once when the run row was an unreported pending retry", async () => {
+    const fixture = await seedNativeRun();
+    await driveToCompleteResult(fixture, {
+      ...CONTROL_PLANE_CONFORMANCE_TERMINAL,
+      turnTerminalState: "failed",
+      runTerminalState: "failed",
+    });
+    const finalize = () => finalizeNativeRun({ db, runId: fixture.runId, workspaceFinalizeStatus: "succeeded", projectRunStatus: true });
+    await finalize();
+    // The executor stores a scheduled same-run retry as failed + retryable_failure,
+    // and reportRunFailure skips that write.
+    await db.update(heartbeatRuns).set({
+      nativePhase: "retryable_failure",
+    }).where(eq(heartbeatRuns.id, fixture.runId));
+    await waitForPendingRunFailureReports();
+    const captureCallsBefore = mockCaptureRunFailure.mock.calls.length;
+
+    await finalize();
+    await waitForPendingRunFailureReports();
+    expect(captureRunFailureCallsFrom(captureCallsBefore)).toEqual([
+      [expect.objectContaining({ runId: fixture.runId, runStatus: "failed" })],
+    ]);
+
+    await finalize();
+    await waitForPendingRunFailureReports();
+    expect(captureRunFailureCallsFrom(captureCallsBefore)).toHaveLength(1);
   });
 
   it("retires this run's scheduled finalization retry after successful commit", async () => {
@@ -880,3 +947,6 @@ describeEmbeddedPostgres("native run finalizer / status decision committer — a
     expect(agentTaskRunCalls(callsBefore)).toHaveLength(1);
   });
 });
+
+
+enableRunFailureReporting();

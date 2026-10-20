@@ -1,5 +1,29 @@
 # Runner E2E security for a public repository
 
+## Attended connection authentication
+
+See [PROVIDER-CONNECTIONS.md](PROVIDER-CONNECTIONS.md) for the explicit-only
+`provider-connections` suite, local/staging target ownership, dedicated browser
+profiles, credential handoffs, private evidence, and cleanup contract.
+
+Provider-connection results may retain closed diagnostic codes and terminal run
+status before managed-instance teardown. Only error records and failed tool
+receipts are inspected; raw error messages, child stderr, model output and
+reasoning are not retained. Unknown causes and unavailable logs stay explicit.
+The optional installed-Gemini filesystem smoke uses synthetic credentials and
+loopback model responses, makes no real provider calls, and removes its
+disposable home/workspace.
+
+The explicit [public MCP suite](PUBLIC-MCP.md) also creates a disposable browser
+account and OAuth grant. Signup and token exchange use Node fetch, credentials
+stay outside model context, and dynamic cookie/code/token values join the
+attempt's redaction set. Tracing, video and automatic screenshots are disabled
+for that suite; only reviewed fixture task routes may produce public screenshots.
+External API evidence retains visible answers and tool outcomes, never raw model
+reasoning. Empty provider configuration directories prevent operator plugins and
+MCP credentials from being inherited. All grants are revoked during cleanup and
+the launcher removes the isolated database and provider homes.
+
 This suite can spend provider money, expose selected local and workflow API credentials to isolated
 test processes, publish a container, retain private visual evidence, and write
 public structured evidence. Treat changes to the workflow, harness, fixture
@@ -7,6 +31,14 @@ prompts, evidence packager, and publisher as security-sensitive production
 changes.
 
 ## GitHub authorization
+
+The Everyday remote Codex restart oracle reads only the existing public run,
+event, environment-lease, workspace-operation and recovery APIs. It does not
+execute commands in a provider sandbox or signal a provider process. Its new
+evidence projects closed receipt metadata and hashes the provider sandbox ID
+and full native event content. Provider text, tool arguments and command output
+do not enter these snapshots. Existing image admission, credentials, billing,
+retention and cleanup rules continue to apply.
 
 Set `RUNNER_E2E_ALLOWED_ACTOR_IDS` to a non-empty JSON array of numeric GitHub
 user IDs. Keep the list equal to the owners of `.github/**` in
@@ -101,6 +133,16 @@ force for every suite.
 The Paperclip server process also receives none; the browser posts each value
 once to the encrypted company secret API and agents/environments retain only
 secret references.
+
+The explicit managed first-task cell observes the wizard's two owned setup
+responses only to correlate their exact lease IDs with same-company environment
+records. Raw probe/setup responses, account references, opaque provider lease
+identities and setup screenshots remain private. Public first-task evidence
+continues through the existing projection. Missing or foreign lease identities
+cannot acquire attribution or a zero-cost estimate; incomplete setup coverage
+stays unavailable even if later task-run billing succeeds. Platform qualification
+uses the existing permission-gated environment probe, without granting new
+permissions or accepting fixture-authored qualification metadata.
 
 The context-integrity catalog lists six pending Kimi/Grok cells for discovery:
 two cases each across `legacy-kimi-cli`, `legacy-kimi-acp`, and `legacy-grok`.
@@ -292,3 +334,40 @@ Cursor, Copilot, GitHub and GH environment variables are stripped from the
 server environment. GitHub PAT shapes are included in retained-evidence scans.
 Candidates have no automatic infrastructure retries; spending must be reconciled
 before a deliberate repeat.
+
+Copilot protection fixtures use production browser/public API permission and
+cancellation paths. Their local one-shot socket accepts a nonce/PID only and owns
+one fixed bounded child; it cannot select commands, arguments, or paths. The exact
+native client command is supplied by the fixture, while production notices retain
+only its SHA-256. The fixture keeps private process identities local, closes its
+owned socket/child in cleanup, and never signals API-reported PIDs. Directory
+watch loss makes the denial oracle incomplete; it must not become a no-effect pass.
+
+Pi Daytona controls bind process identity to the independent Linux observer's
+PID, start ticks and boot ID within the exact admitted run/lease/sandbox. The
+controller's `processStartedAt` annotations may change as launch metadata settles
+and do not identify a remote process birth. Every remote snapshot and retirement
+seal must retain the original birth identity and complete no-effect journal.
+Local controls retain their separate public process-authority comparison.
+
+Pi provider-death admission accepts the native bootstrap's `/proc/self/fd/3`
+or `/proc/self/fd/7` wrapper launch only after binding that held descriptor and
+the wrapper executable to the sealed snapshot Node inode. Exact guard and
+entrypoint paths, closure hashes, Pi title, run/lease ancestry and fresh process
+birth checks remain required. Other descriptor aliases, missing descriptors and
+foreign inodes fail before any signal. Native Linux calibration exercises both
+descriptor launches with synthetic owned processes and no provider credentials;
+it does not qualify paid Pi behavior or change previous failed grades.
+
+The private resource-admission marker and raw cleanup results control recovery-state retention independently of evidence packaging. A worker crash after admission keeps the owner-only recovery database; a confirmed pre-allocation bootstrap failure does not. Neither the marker nor the database enters published evidence.
+
+## Task workspace fixture source
+
+The explicit task-workspaces cells fetch the existing public octocat/Hello-World
+repository through normal anonymous repository preparation. They do not clone the
+Paperclip checkout, copy its Git credentials, create remote repositories or push.
+The agent's synthetic commit remains in the disposable task workspace. Independent
+Git reads validate that workspace's canonical path is inside the isolated instance
+before examining history. The existing credential redactor, private evidence
+packager and task-only screenshot allowlist remain authoritative. Each cell has a
+single attempt, three requested turns and company/agent budget hard stops.

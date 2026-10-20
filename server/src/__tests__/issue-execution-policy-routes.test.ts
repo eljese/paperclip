@@ -1,6 +1,6 @@
 import express from "express";
 import request from "supertest";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { normalizeIssueExecutionPolicy } from "../services/issue-execution-policy.ts";
 
 const mockIssueService = vi.hoisted(() => ({
@@ -173,11 +173,15 @@ type TestActor =
       runId: string | null;
     };
 
-async function createApp(actor?: TestActor) {
-  const [{ errorHandler }, { issueRoutes }] = await Promise.all([
+function loadAppModules() {
+  return Promise.all([
     import("../middleware/index.js"),
     import("../routes/issues.js"),
   ]);
+}
+
+async function createApp(actor?: TestActor) {
+  const [{ errorHandler }, { issueRoutes }] = await loadAppModules();
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
@@ -196,12 +200,16 @@ async function createApp(actor?: TestActor) {
 }
 
 describe("issue execution policy routes", () => {
-  beforeEach(() => {
+  beforeAll(async () => {
     vi.resetModules();
     vi.doUnmock("../services/index.js");
     vi.doUnmock("../routes/issues.js");
     vi.doUnmock("../middleware/index.js");
     registerModuleMocks();
+    await loadAppModules();
+  });
+
+  beforeEach(() => {
     vi.clearAllMocks();
     mockIssueService.assertCheckoutOwner.mockResolvedValue({ adoptedFromRunId: null });
     mockIssueService.getByIdForUpdate.mockImplementation(async () => mockIssueService.getById());
@@ -263,6 +271,34 @@ describe("issue execution policy routes", () => {
       };
     });
     mockAccessService.hasPermission.mockResolvedValue(false);
+  });
+
+  it.each([
+    { status: "done" },
+    { status: "cancelled" },
+    { assigneeAgentId: "33333333-3333-4333-8333-333333333333" },
+    { assigneeUserId: "operator" },
+    { interrupt: true },
+    { comment: "Continue now" },
+  ])("rejects mixed snapshot-guarded updates before execution side effects: %j", async (controlFields) => {
+    const res = await request(await createApp({ type: "board", source: "local_implicit", userId: "local-board" }))
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({ expectedExecutionPolicy: null, executionPolicy: null, ...controlFields });
+    expect(res.status).toBe(422);
+    expect(res.body.error).toContain("policy-only");
+    expect(mockIssueService.getById).not.toHaveBeenCalled();
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+    expect(mockRunnerGoalService.act).not.toHaveBeenCalled();
+    expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
+  });
+
+  it("rejects a snapshot without a policy update", async () => {
+    const res = await request(await createApp({ type: "board", source: "local_implicit", userId: "local-board" }))
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({ expectedExecutionPolicy: null });
+    expect(res.status).toBe(422);
+    expect(mockIssueService.getById).not.toHaveBeenCalled();
+    expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
   it("reauthorizes a terminal verdict against the review policy held under the update lock", async () => {

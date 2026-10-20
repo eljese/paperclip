@@ -1102,6 +1102,12 @@ describe("stageCodexHomeForSync", () => {
       const { home, authBytes, skillBytes } = await buildFakeHome(root);
       staged = await stageCodexHomeForSync(home, { runId: "run-1" });
 
+      expect((await fs.stat(staged)).mode & 0o777).toBe(0o700);
+      for (const entry of ["auth.json", "config.toml", "config.json", "instructions.md"]) {
+        const mode = (await fs.stat(path.join(staged, entry))).mode & 0o777;
+        expect(mode, `${entry} should be staged 0600`).toBe(0o600);
+      }
+
       const entries = (await fs.readdir(staged)).sort();
       expect(entries).toEqual([...CODEX_SYNC_ALLOWLIST].sort());
 
@@ -1128,21 +1134,6 @@ describe("stageCodexHomeForSync", () => {
     }
   });
 
-  // C1 — staged credential file must be mode 0600 (not the world-readable default).
-  it("writes the staged auth.json with mode 0600", async () => {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-stage-mode-"));
-    let staged: string | null = null;
-    try {
-      const { home } = await buildFakeHome(root);
-      staged = await stageCodexHomeForSync(home, { runId: "run-mode" });
-      const mode = (await fs.stat(path.join(staged, "auth.json"))).mode & 0o777;
-      expect(mode).toBe(0o600);
-    } finally {
-      if (staged) await fs.rm(staged, { recursive: true, force: true });
-      await fs.rm(root, { recursive: true, force: true });
-    }
-  });
-
   // config.toml carries the managed MCP `Authorization: Bearer …` header and is
   // secret-bearing; the staged copy must be 0600, not the world-readable default.
   it("writes the staged config.toml (managed MCP bearer header) with mode 0600", async () => {
@@ -1161,39 +1152,6 @@ describe("stageCodexHomeForSync", () => {
       staged = await stageCodexHomeForSync(home, { runId: "run-toml-mode" });
       const mode = (await fs.stat(path.join(staged, "config.toml"))).mode & 0o777;
       expect(mode).toBe(0o600);
-    } finally {
-      if (staged) await fs.rm(staged, { recursive: true, force: true });
-      await fs.rm(root, { recursive: true, force: true });
-    }
-  });
-
-  // Least privilege: no staged regular file needs group/other read, so every
-  // one (config.json, instructions.md — not just credentials) is staged 0600.
-  it("writes every staged regular file with mode 0600", async () => {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-stage-all-mode-"));
-    let staged: string | null = null;
-    try {
-      const { home } = await buildFakeHome(root);
-      staged = await stageCodexHomeForSync(home, { runId: "run-all-mode" });
-      for (const entry of ["auth.json", "config.toml", "config.json", "instructions.md"]) {
-        const mode = (await fs.stat(path.join(staged, entry))).mode & 0o777;
-        expect(mode, `${entry} should be staged 0600`).toBe(0o600);
-      }
-    } finally {
-      if (staged) await fs.rm(staged, { recursive: true, force: true });
-      await fs.rm(root, { recursive: true, force: true });
-    }
-  });
-
-  // C2 — staged dir must be 0700 (mkdtemp guarantees this on POSIX).
-  it("creates the staged dir with mode 0700", async () => {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-stage-dir-"));
-    let staged: string | null = null;
-    try {
-      const { home } = await buildFakeHome(root);
-      staged = await stageCodexHomeForSync(home, { runId: "run-dir" });
-      const mode = (await fs.stat(staged)).mode & 0o777;
-      expect(mode).toBe(0o700);
     } finally {
       if (staged) await fs.rm(staged, { recursive: true, force: true });
       await fs.rm(root, { recursive: true, force: true });
@@ -1290,23 +1248,22 @@ describe("stageCodexHomeForSync", () => {
     }
   });
 
-  // Mode normalization: nested skill files must be staged 0600 regardless of
-  // their source mode (0644 documents, 0755 scripts, etc.).
-  it("writes nested skill files with mode 0600 regardless of source mode", async () => {
+  // Skill staging retains executable permission with owner-only access.
+  it("retains skill executable bits without group or world permissions", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-stage-skill-mode-"));
     let staged: string | null = null;
     try {
       const home = path.join(root, "codex-home");
       await fs.mkdir(path.join(home, "skills", "my-skill"), { recursive: true });
       // Typical source modes: readable doc (0644) and executable script (0755);
-      // both must land 0600 in the staged dir.
+      // documents land 0600, scripts 0700 in the staged dir.
       await fs.writeFile(path.join(home, "skills", "my-skill", "SKILL.md"), "# skill\n", { mode: 0o644 });
       await fs.writeFile(path.join(home, "skills", "my-skill", "run.sh"), "#!/bin/sh\n", { mode: 0o755 });
 
       staged = await stageCodexHomeForSync(home, { runId: "run-skill-mode" });
       for (const rel of ["my-skill/SKILL.md", "my-skill/run.sh"]) {
         const mode = (await fs.stat(path.join(staged, "skills", rel))).mode & 0o777;
-        expect(mode, `skills/${rel} should be staged 0600`).toBe(0o600);
+        expect(mode, `skills/${rel} mode`).toBe(rel.endsWith(".sh") ? 0o700 : 0o600);
       }
     } finally {
       if (staged) await fs.rm(staged, { recursive: true, force: true });

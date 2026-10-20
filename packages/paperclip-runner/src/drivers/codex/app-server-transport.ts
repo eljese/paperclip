@@ -1,7 +1,11 @@
+import { configuredEnvironment } from "../../configured-environment.js";
 import type { NativeTurnControlCapabilities } from "../../contracts/types.js";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import type { HarnessRuntimeRequestResolution } from "../../contracts/harness-driver.js";
 import { githubCredentialEnvironment } from "../../github-credential-environment.js";
+import { redactCodexDiagnostic } from "./diagnostic-redaction.js";
+
+export { redactCodexDiagnostic } from "./diagnostic-redaction.js";
 
 export interface CodexRpcNotification {
   method: string;
@@ -31,6 +35,7 @@ export type CodexServerRequestHandler = (
 ) => Promise<Record<string, unknown>>;
 
 export interface CodexAppServerTransport {
+  supportsTurnReasoning?(): boolean;
   /** Runner-owned live capability projection; absent on native Codex transports. */
   turnControlCapabilities?(): NativeTurnControlCapabilities | null;
   request(
@@ -40,6 +45,8 @@ export interface CodexAppServerTransport {
   notify(method: string, params?: Record<string, unknown>): void;
   notifications(): AsyncIterable<CodexRpcNotification>;
   setServerRequestHandler(handler: CodexServerRequestHandler): void;
+  /** One-shot requests authenticated by an adopted live provider, never a saved checkpoint alone. */
+  takeRestoredRuntimeRequests?(): CodexRpcServerRequest[];
   /**
    * Optional provider-neutral resolution path used when a transport has
    * already normalized a native server request behind another PRP boundary.
@@ -200,6 +207,8 @@ const SAFE_ENVIRONMENT_KEYS = [
   "AGENT_HOME",
   "ALL_PROXY",
   "CODEX_HOME",
+  // Only the selected managed provider credential enters the trusted server.
+  "PAPERCLIP_AI_PROVIDER_KEY",
   "HOME",
   "HTTP_PROXY",
   "HTTPS_PROXY",
@@ -208,6 +217,10 @@ const SAFE_ENVIRONMENT_KEYS = [
   "NO_PROXY",
   "NODE_EXTRA_CA_CERTS",
   "PAPERCLIP_RUNNER_EXTERNAL_SANDBOX",
+  "PAPERCLIP_RUNNER_HOME_MODE",
+  "XDG_CONFIG_HOME",
+  "XDG_DATA_HOME",
+  "XDG_CACHE_HOME",
   "PATH",
   "PATHEXT",
   "SSL_CERT_FILE",
@@ -224,8 +237,10 @@ const SAFE_ENVIRONMENT_KEYS = [
  * separate empty-by-default environment and filesystem permission profile.
  */
 export function createSanitizedCodexEnvironment(
-  source: NodeJS.ProcessEnv = process.env,
+  source?: NodeJS.ProcessEnv,
 ): NodeJS.ProcessEnv {
+  const explicit = source;
+  source ??= process.env;
   const environment: NodeJS.ProcessEnv = {};
   for (const key of SAFE_ENVIRONMENT_KEYS) {
     const value = source[key];
@@ -233,7 +248,10 @@ export function createSanitizedCodexEnvironment(
     if (key.includes("PROXY") && proxyContainsCredentials(value)) continue;
     environment[key] = value;
   }
-  Object.assign(environment, githubCredentialEnvironment(source));
+  for (const key of ["PAPERCLIP_AGENT_KEY_ID", "PAPERCLIP_AGENT_PUBLIC_KEY", "PAPERCLIP_AGENT_PRIVATE_KEY"]) {
+    if (explicit?.[key] !== undefined) environment[key] = explicit[key];
+  }
+  Object.assign(environment, githubCredentialEnvironment(source), configuredEnvironment(explicit));
   return environment;
 }
 
@@ -241,40 +259,6 @@ export function sanitizedEnvironmentKeys(
   source: NodeJS.ProcessEnv = process.env,
 ): string[] {
   return Object.keys(createSanitizedCodexEnvironment(source)).sort();
-}
-
-export function redactCodexDiagnostic(message: string): string {
-  return message
-    .replaceAll(/\u001b\[[0-?]*[ -/]*[@-~]/g, "")
-    .replace(/Bearer\s+[A-Za-z0-9._~+\/-]+/gi, "Bearer [REDACTED]")
-    .replace(/Basic\s+([A-Za-z0-9+/=]+)/gi, (match, encoded: string) => {
-      try {
-        // Only redact an actual RFC 7617 credential. Treating every word after
-        // “Basic” as base64 corrupted ordinary question copy such as
-        // “Basic API” before it entered the Paperclip protocol.
-        const decoded = Buffer.from(encoded, "base64").toString("utf8");
-        return decoded.includes(":") ? "Basic [REDACTED]" : match;
-      } catch {
-        return match;
-      }
-    })
-    .replace(/([a-z][a-z0-9+.-]*:\/\/)[^\s/@:]+:[^\s/@]+@/gi, "$1[REDACTED]@")
-    .replace(
-      /([?&](?:api[_-]?key|token|secret|password)=)[^&#\s]+/gi,
-      "$1[REDACTED]",
-    )
-    .replace(
-      /(["'](?:api[_-]?key|token|secret|password|authorization)["']\s*:\s*["'])[^"']+/gi,
-      "$1[REDACTED]",
-    )
-    .replace(
-      /(api[_-]?key|token|secret|password)\s*[=:]\s*[^\s,;]+/gi,
-      "$1=[REDACTED]",
-    )
-    .replace(
-      /(PAPERCLIP_API_KEY|OPENAI_API_KEY|OPENROUTER_API_KEY)=[^\s]+/g,
-      "$1=[REDACTED]",
-    );
 }
 
 function proxyContainsCredentials(value: string): boolean {

@@ -23,7 +23,10 @@ The canonical host directory keeps its existing physical location:
     any-supported-file
   file-sync/                   controller-only operational state
     adopted.json
-    runs/<run>/live/           isolated writable copy while a run executes
+    canonical-manifest.json   metadata/hash cache, no file contents
+    runs/<initial-run>/
+      owner.json              current run owning the writable copy
+      live/                   writable copy for the provider lifetime
 ```
 
 The process starts in its existing task workspace. `AGENT_HOME` points to the
@@ -33,6 +36,22 @@ the task workspace. Remote providers currently confine file sync to their
 workspace: their independent agent copy therefore lives under the excluded
 `.paperclip-runtime/agent-files/<agent>/<run>/` area. It is not included in task
 workspace sync, Git staging, or task deliverables.
+
+Sandbox transfer scratch lives separately under
+`.paperclip-runtime/paperclip-runner/agent-file-transfers/<agent>/<run>/`.
+Workspace-staging transfer scratch stays outside `AGENT_HOME`, including
+recovery after controller restart. Remote warm Codex checkpoints may temporarily
+stage changed-file payloads under `AGENT_HOME/.paperclip-runtime/checkpoint-*`;
+these are checkpoint scratch, not managed personal files. Cleanup removes
+only the original materialization's agent directory and transfer scratch
+through its owned lease. A later warm turn keeps that original materialization
+identity; it does not grant collection or cleanup of another run's files.
+
+Claude CLI runs keep the working-copy location in each run's prompt, separate
+from the cached system instructions. A new copy path alone does not reset the
+task session. Each turn names the current copy for relative file references;
+instruction or enabled skill content changes still invalidate the prompt bundle.
+Sessions saved with the older path-bearing bundle start fresh once after upgrade.
 
 Regular files (including binary bytes) and directories are supported, up to
 100,000 entries (files and folders), 256 MiB per file and 2 GiB total. Symlinks,
@@ -75,13 +94,20 @@ the run detail also shows warnings from its save receipt. The editor only shows
 preserved instruction-only candidates that may need review, alongside errors
 from the current browser edit. Later successful saves do not erase run history.
 
-Larger folders take longer to hash, copy, and transfer on each run. There is one
-canonical folder plus temporary working copies for currently active runs (and
-remote staging when the transport needs it). No additional captured tree is
-created. Terminal runs remove their private trees and baseline metadata, keeping
-only a small receipt. Restart recovery retries interrupted cleanup without
-removing a running provider's files. These are not aggregate disk quotas; the
-operator still provisions storage for agents and the configured run concurrency.
+Initial restoration copies the canonical folder once. Warm native Codex turns
+reuse that working directory. Checkpoints enumerate file metadata, hash files
+whose identity/size/mode/mtime/ctime changed, and temporarily copy and transfer
+only changed file contents. Deletions and empty directories travel as manifest
+entries. An unchanged image is neither rehashed nor recopied after its first
+checkpoint. A modified file is transferred in full; this is a file-level delta,
+not block-level deduplication. Canonical hash caches and manifests contain no
+file contents. Temporary checkpoint payloads are removed after application.
+The operator still provisions storage for the canonical folders, active working
+copies and changed-file payloads; these are not aggregate disk quotas.
+
+Other providers use full-directory collection after verified retirement. A
+successful warm ACP turn can retain its unchanged copy with the still-running
+provider; restart recovery preserves files until retirement is proven.
 
 ## Run lifecycle
 
@@ -90,21 +116,87 @@ operator still provisions storage for agents and the configured run concurrency.
    revision history.
 2. Stage the copy through the existing workspace transport. Point `AGENT_HOME`
    and instruction guidance at that registered root.
-3. At the provider's verified checkpoint-and-stop boundary, retrieve the entire
-   directory into the existing working copy before releasing its environment.
+3. For warm native Codex, capture a manifest and changed-file payload at each
+   terminal turn boundary before admitting another turn. Check file metadata
+   before and after streaming and hash the captured payload independently on
+   the host. Retry an unstable checkpoint up to three times; if it cannot be
+   validated, close the owned provider and perform the stopped collector. Other
+   execution paths retain their stopped-provider collection boundary.
 4. Recheck the responsible user's current authorization. Under the same agent
    lock used by editor writes, apply only files changed or deleted relative to
-   the starting baseline. For a competing edit or deletion of the same file,
-   the last synchronization to acquire the lock wins. Unchanged files do not
-   overwrite another run's changes; newly added unrelated files survive.
-5. Record the outcome and remove temporary copies for successful and failed
-   runs. No per-run file versions, conflict copies, or review queue accumulate.
-   The next run starts with the current directory.
+   the last acknowledged baseline. For a competing edit or deletion of the same
+   file, the last synchronization to acquire the lock wins. Unchanged files do
+   not overwrite another run's changes; newly added unrelated files survive.
+5. Record the save receipt and advance the baseline only after application. A
+   warm session keeps its directory and hands ownership to the next run using
+   a controller-owned marker. Old callbacks cannot collect or remove the next
+   owner's files. On session retirement, collect any later writes and remove
+   the private directory. No per-run file versions or conflict copies accumulate.
 
-The whole-directory contract closes the provider process to establish a safe
-collection boundary, including child processes. It preserves the provider's
-resumable conversation. Only the loaded instruction entry participates in the
-new runtime instruction digest; adding or editing another file does not change
+These are validated **per-file checkpoints**, not an atomic snapshot of arbitrary
+background writers across an entire directory. Writes after a checkpoint remain
+pending until the next checkpoint or verified session retirement. A save receipt
+acknowledges only the captured bytes. Lost remote bytes or missing stop proof
+cannot become a successful save.
+
+Warm reuse requires the actual live session, the same remote environment and
+provider lease, and unchanged canonical files since its last checkpoint. An
+editor or another task changing canonical files retires that session before a
+fresh copy is restored. A directory-path mismatch also forces retirement. Only
+the loaded instruction entry participates in the runtime instruction digest;
+ordinary memory/image edits do not change it. Changes to loaded instructions,
+policy, credentials or provider configuration may still replace the process.
+Relative supporting files are read from `AGENT_HOME`, not the read-only prompt
+snapshot. External instruction bundles remain read-only and use their existing
+lifecycle.
+
+For warm ACP providers, unchanged whole-directory retention uses the following
+additional ownership and lease fences:
+
+A successful warm turn may retain its complete, unchanged materialized directory
+and the exact `AGENT_HOME` root with the same provider process. A bounded read-only
+probe must verify the full baseline and root identity without unsafe paths or
+concurrent changes. Local hashing runs in an isolated child; remote observation
+runs at the registered remote root. A failed or uncertain probe requires stopped
+collection. The next authorized run claims that same materialization within the
+company, agent, workspace, environment and configuration scope. Projectless runs
+use the stable workspace descriptor (cwd, repository URL/ref and branch), rather
+than the per-run workspace placeholder. A remote handoff verifies both DB leases
+belong to the same company, environment and provider allocation, then binds the
+successor run's active lease and collector without re-uploading the host mirror.
+Heartbeat explicitly permits a collection-only successor handoff before checking
+warm reuse. A changed or uncertain directory records durable `retirementRequired`;
+that receipt cannot authorize reuse. The successor capability is installed only
+after the ownership transaction commits. Configuration changes and abandoned
+preparation then stop the provider and collect through that current capability,
+never an expired prior lease. Ordinary adoption remains unchanged-only. Failed
+authorization or lease validation retires the prior owner without borrowing an
+unverified successor; if its lease is unusable, the bytes remain pending.
+Before initial admission, the remote transfer's two empty scratch directories are
+removed with exact-path, identity-checked `rmdir` operations. Any content, link or
+uncertain identity fails preparation; the complete probe never excludes them.
+An exact recorded lease that is missing or no longer matches the run/environment
+blocks retrieval as well as deletion. Legacy receipts without a lease ID require
+exactly one company/run/environment lease, including when a transport is still
+cached. Missing or ambiguous ownership preserves pending files without remote
+commands. No SSH exception bypasses this fence, and no-ID receipts grant no warm
+adoption authority.
+The original materialization root remains unchanged. The prior run
+loses collection authority; stale cleanup cannot remove the current owner's root.
+
+Edits, additions, removals or changed configuration retire the owner before
+collection and fresh preparation. A configuration or copy change found at the
+final dispatch fence fails that run after retirement; it does not replay the
+request automatically. Idle expiry, restart and abandoned preparation also retire
+before collection. Immediate collection retries have a fixed call budget and must
+advance; a deferred ownership state ends the callback without inventing attempts.
+A failed close leaves an unstopped pending receipt through generic run cleanup.
+Later owner retirement or independent current-run stop proof can still collect it;
+a prior run's stop proof cannot authorize collection. The whole-directory contract
+closes the provider process,
+including child processes, to establish this safe collection boundary. It
+preserves the provider's resumable conversation. Only the loaded instruction entry
+participates in the new runtime instruction digest; adding or editing another file does not change
 that digest. Relative supporting files are read from `AGENT_HOME`, not from the
 read-only prompt snapshot.
 
@@ -150,17 +242,50 @@ New current-file bytes are not database revision rows. Old instruction-only
 candidates are retained solely for upgrade compatibility.
 
 Crash recovery can collect a stopped working copy without starting a model.
+Cleanup does not wait for a directory lock before process-stop proof exists, or
+after the copy is superseded or cleanup is complete. An unavailable copy keeps
+its failed-save receipt. Recovery can later clean an unavailable remote copy
+after destruction of its exact lease and executes no remote command. An
+unavailable local copy can still contain uncollected edits; this cleanup path
+preserves those bytes even if local stop proof arrives later.
+Deferred cleanup retries after a
+delay so one blocked copy does not prevent other copies from being cleaned.
+If releasing a run's instruction copy fails, the run records a cleanup warning
+and leaves the durable copy for the recovery sweep. Cleanup does not replace the
+provider's result, discard usage accounting, or prevent environment lease release.
+It does not claim that unsaved agent-file changes were saved; collection failures
+keep their separate failed-save receipts. A run attempts failed cleanup only once
+before handing it to recovery, rather than repeating the lock wait in teardown.
+Re-preparing an existing run uses the same lock as cleanup and rechecks its
+receipt under that lock. Preparing a new run keeps its separate admission path.
 Missing stop proof or lost remote bytes produce a visible diagnostic, never a
 save receipt. An interrupted apply can replay its changed files with the same
 last-sync-wins rule. Cleanup resumes for terminal runs; no copy is retained as
 an archive after cleanup succeeds.
 
+An unchanged-turn observation is neither a save nor proof that a provider stopped.
+If retirement fails, the controller records unresolved ownership and preserves
+the materialized root. A crash after ownership transfer can leave the new run
+without independently recorded stop proof; terminal run status or the old run's
+alias is not enough to collect that root. Recovery leaves it preserved until the
+required proof is available. Exact destruction of the current owner's remote
+allocation permits an explicit unavailable/no-save outcome and owned local
+cleanup. A stopped-but-retained allocation instead stays pending with its files
+preserved. The current remote execute API may restart a stopped sandbox even
+when it bypasses a persistent session, so recovery cannot use it for retrieval
+or deletion. Safe retrieval from a stopped allocation remains a transport gap;
+live owner retirement still collects before the environment stops. No save is
+claimed for the pending case, and stale prior-run leases cannot authorize cleanup.
+
 ## Verification
 
 `agent-directory-working-copies.test.ts` exercises nested/binary files, directory
 isolation, last-sync-wins edits and deletions, terminal cleanup, link rejection, old-head
-adoption, and stable prompt digests. The legacy working-copy and native-tool
-suites exercise compatibility. Workspace merge tests exercise preflight and
+adoption, stable prompt digests, warm ownership transfer, concurrent stale claims,
+and stop-proved recovery. `agent-directory-probe.test.ts` covers stable snapshots,
+unsafe paths, mutation races and bounded child failures; composed native executor
+tests cover retained roots and retirement before collection. The legacy
+working-copy and native-tool suites exercise compatibility. Workspace merge tests exercise preflight and
 interrupted replay.
 
 The explicit Product E2E `instruction-persistence` suite creates a file through

@@ -4,7 +4,7 @@ import { paperclipWorkspaceFileReferencesFromText } from "../../live/workspace-f
 import { canonicalProviderEventsFromCodex, isCanonicalProviderEventType } from "../../provider-events.js";
 import { harnessRuntimeRequestOutcome } from "../../contracts/harness-driver.js";
 import { NativeSessionProtocolIntegrityError } from "../../contracts/native-session-backend.js";
-import { validatePrpStructuredRunResult } from "../../protocol/replay-contract.js";
+import { isPrpAuthCredentialsUpdated, validatePrpStructuredRunResult } from "../../protocol/replay-contract.js";
 import type { CodexRpcNotification, CodexTraceInterpretation } from "./app-server-transport.js";
 import { redactCodexDiagnostic } from "./app-server-transport.js";
 import { boundedCodexPayload as boundedPayload, boundedCodexValue, isRetainableCodexPayload } from "./codex-boundaries.js";
@@ -156,6 +156,14 @@ async function mapNotificationBody(state: CodexSessionState, notification: Codex
         return;
       }
       const canonicalPayload = record(params.payload);
+      if (params.eventType === "auth.credentials.updated") {
+        if (!isPrpAuthCredentialsUpdated(canonicalPayload)) {
+          state.failProtocol("credential_update_invalid", "Invalid credential update notification.");
+          return;
+        }
+        state.emit(params.eventType, canonicalPayload, { turnId: turnId || undefined, itemId: itemId || undefined });
+        return;
+      }
       if (params.eventType === "harness.diagnostic" && canonicalPayload.code === "codex_resume_usage_snapshot") {
         state.codexUsageBaseline = observeCodexUsage(state.codexUsageBaseline, canonicalPayload.cumulative, true);
         state.usageSnapshot = codexRunUsage(state.codexUsageBaseline);
@@ -331,12 +339,12 @@ async function mapNotificationBody(state: CodexSessionState, notification: Codex
     if (
       notification.method === "item/completed"
       && text(params.kind) === "steering_acknowledgement"
-      && Object.keys(item).length === 0
     ) {
       // runnerd persists its own command acknowledgement as a canonical PRP
       // item. The request() call is already the authoritative acknowledgement
       // and steer() emits the user-visible item with the active turn binding.
-      // Do not reinterpret this transport-level echo as an unbound Codex item.
+      // Rehydration adds an item object to this transport echo; it still must
+      // not become a second acknowledgement beside the correlation-bound item.
       return;
     }
     if (notification.method === "paperclip/runResult") {
@@ -533,9 +541,19 @@ async function mapNotificationBody(state: CodexSessionState, notification: Codex
     }
     if (notification.method === "thread/tokenUsage/updated") {
       state.usageSnapshot = boundedPayload(record(params.tokenUsage));
-      if (state.driverKind === "codex_app_server" && Object.keys(record(record(params.tokenUsage).total)).length > 0) {
-        state.codexUsageBaseline = observeCodexUsage(state.codexUsageBaseline, record(params.tokenUsage).total, false);
-        state.usageSnapshot = { ...state.usageSnapshot, ...codexRunUsage(state.codexUsageBaseline) };
+      if (state.driverKind === "codex_app_server") {
+        const reported = record(record(params.tokenUsage).total);
+        const validCount = (value: unknown) => typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+        // The monotonic snapshot retains absent counters from older reports.
+        // Preserve whether this provider report can actually close accounting.
+        const runDeltaComplete = validCount(reported.inputTokens) && validCount(reported.outputTokens)
+          && Object.entries(reported).every(([key, value]) => !key.endsWith("Tokens") || validCount(value))
+          && Object.keys(state.codexUsageBaseline?.latest ?? {}).every(key => !key.endsWith("Tokens") || validCount(reported[key]));
+        if (Object.keys(reported).length > 0) {
+          state.codexUsageBaseline = observeCodexUsage(state.codexUsageBaseline, reported, false);
+          state.usageSnapshot = { ...state.usageSnapshot, ...codexRunUsage(state.codexUsageBaseline) };
+        }
+        state.usageSnapshot = { ...state.usageSnapshot, runDeltaComplete };
       }
       // Codex can replay a thread-scoped usage snapshot while a resumed thread
       // is being attached, before the next turn has started. Keep the snapshot,

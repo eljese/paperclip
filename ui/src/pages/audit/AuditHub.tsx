@@ -10,6 +10,7 @@ import { Costs } from "@/pages/Costs";
 import { Timeline } from "@/pages/Timeline";
 import { AuditFeed, type AuditFeedMode } from "./AuditFeed";
 import { AuditRuns } from "./AuditRuns";
+import { AgentCommentary } from "./AgentCommentary";
 import { RoutineAuditActivity } from "./RoutineAuditActivity";
 import {
   AUDIT_SECTIONS,
@@ -85,10 +86,6 @@ export function AuditHub({ section }: { section: AuditSection }) {
     <div className="space-y-6">
       <div>
         <h1 className="text-3xl font-semibold tracking-tight text-foreground">Audit</h1>
-        <p className="mt-2 max-w-3xl text-sm leading-6 text-muted-foreground">
-          Review what happened, inspect agent runs, and understand the costs and budget controls
-          behind your organization.
-        </p>
       </div>
 
       <Tabs
@@ -101,7 +98,9 @@ export function AuditHub({ section }: { section: AuditSection }) {
         <PageTabBar items={AUDIT_SECTIONS} value={section} align="start" />
       </Tabs>
 
-      {section === "activity" && routineId ? (
+      {section === "commentary" ? (
+        <AgentCommentary key={selectedCompanyId} companyId={selectedCompanyId} />
+      ) : section === "activity" && routineId ? (
         <RoutineAuditActivity companyId={selectedCompanyId} routineId={routineId} />
       ) : section === "activity" ? (
         <AuditFeed
