@@ -499,7 +499,13 @@ export function prepareBundledPackage(sourceDir, destinationDir, { sourceRoot = 
   }
 
   const deployedPackagePath = resolve(destinationDir, "package.json");
-  const publishManifest = materializePublishManifest(sourcePackage);
+  const publishManifest = materializePublishManifest(sourcePackage, {
+    // Resolve workspace:* to each target's own version (e.g. plugin-sdk
+    // 1.0.0, not the dependent's 0.3.1); without sourceRoot independently
+    // versioned deps fall back to pkg.version and git-source installs break.
+    workspaceVersions,
+    sourceRoot,
+  });
   const rootPackage = JSON.parse(readFileSync(resolve(sourceRoot, "package.json"), "utf8"));
   const profileData = bundledDependencies.includes("@agentclientprotocol/codex-acp")
     ? JSON.parse(readFileSync(resolve(sourceRoot, "packages/paperclip-runner/acpx-profiles.json"), "utf8")) : undefined;
