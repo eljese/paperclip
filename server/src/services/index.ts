@@ -205,6 +205,10 @@ export {
   reconcileCodexLocalManagedHomesOnStartup,
   type CodexAuthReconciliationSummary,
 } from "./codex-auth-reconciliation.js";
+export {
+  reconcileManagedSkillLinksOnStartup,
+  type ManagedSkillLinkReconciliationSummary,
+} from "./managed-skill-link-reconciliation.js";
 export { reconcilePersistedRuntimeServicesOnStartup, restartDesiredRuntimeServicesOnStartup } from "./workspace-runtime.js";
 export { createStorageServiceFromConfig, getStorageService } from "../storage/index.js";
 export {
